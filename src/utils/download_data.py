@@ -12,7 +12,7 @@ def download_and_save(dataset_name="harvard-lil/cold-cases", split="train"):
     with a progress bar.
     """
     # Define the path for the raw data directory
-    # This assumes a directory structure like: project/src/scripts/download_filtered_data.py
+    # This assumes a directory st ructure like: project/src/scripts/download_filtered_data.py
     # and project/data/raw/
     try:
         raw_data_dir = os.path.join(os.path.dirname(__file__), "../../data/raw")
@@ -27,11 +27,11 @@ def download_and_save(dataset_name="harvard-lil/cold-cases", split="train"):
     # Load the entire dataset split first in order to filter it by date
     ds = load_dataset(dataset_name, split=split)
 
-    print("Filtering data for years 2020-2024...")
+    print("Filtering data for years...")
 
     # Define a function to filter records based on the date field
     def filter_by_year(example):
-        target_years = {2020, 2021, 2022, 2023, 2024}  # Use integers for datetime comparison
+        target_years = {2022, 2023, 2024}  # Use integers for datetime comparison
 
         # The correct field name is 'date_filed' and it contains datetime.date objects
         date_value = example.get('date_filed')
@@ -57,10 +57,10 @@ def download_and_save(dataset_name="harvard-lil/cold-cases", split="train"):
 
     # Apply the filter to the dataset
     filtered_ds = ds.filter(filter_by_year)
-    print(f"Found {len(filtered_ds):,} records with dates between 2020 and 2024.")
+    print(f"Found {len(filtered_ds):,} records with dates between 2021 and 2024.")
 
-    # Limit to 100,000 rows, but select them randomly
-    num_rows_to_save = 100000
+    # Limit to 70,000 rows, but select them randomly
+    num_rows_to_save = 30000
     if len(filtered_ds) > num_rows_to_save:
         # Generate random indices for sampling
         total_rows = len(filtered_ds)
@@ -75,7 +75,7 @@ def download_and_save(dataset_name="harvard-lil/cold-cases", split="train"):
             f"The number of filtered rows ({len(filtered_ds):,}) is less than {num_rows_to_save:,}, saving all of them.")
 
     # Define the output filename to reflect the applied filters
-    output_filename = f"{dataset_name.replace('/', '_')}_{split}_2020-2024_random100k.csv"
+    output_filename = f"{dataset_name.replace('/', '_')}_{split}_2021-2024_random100k.csv"
     output_path = os.path.join(raw_data_dir, output_filename)
 
     try:
