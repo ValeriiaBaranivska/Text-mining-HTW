@@ -8,6 +8,15 @@ from collections import Counter
 import json
 import warnings
 warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=UserWarning, module='joblib')
+
+# Enable parallel processing
+import os
+os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count()))
+
+# For force cleanup
+import gc
+import joblib
 
 # Text preprocessing
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
@@ -161,7 +170,13 @@ class LegalTopicModeling:
     def get_lda_topics(self, lda: LatentDirichletAllocation, 
                        vectorizer: CountVectorizer, n_words: int = 10) -> List[Dict]:
         """Extract topics from LDA model"""
-        feature_names = vectorizer.get_feature_names_out()
+        try:
+            # Try the newer method first
+            feature_names = vectorizer.get_feature_names_out()
+        except AttributeError:
+            # Fall back to older method for older sklearn versions
+            feature_names = vectorizer.get_feature_names()
+        
         topics = []
         
         for topic_idx, topic in enumerate(lda.components_):
@@ -250,7 +265,7 @@ class LegalTopicModeling:
             plt.savefig('lda_topics.png', dpi=300, bbox_inches='tight')
             print("📊 LDA topics visualization saved as 'lda_topics.png'")
         
-        plt.show()
+        #plt.show()
     
     def visualize_topic_distribution(self, lda_output: np.ndarray, topics: List[Dict], 
                                    save_plot: bool = True):
@@ -311,7 +326,7 @@ class LegalTopicModeling:
             plt.savefig('topic_distribution.png', dpi=300, bbox_inches='tight')
             print("📊 Topic distribution saved as 'topic_distribution.png'")
         
-        plt.show()
+        #plt.show()
     
     def visualize_bertopic_results(self, topic_model: BERTopic, documents: List[str], 
                                  save_plot: bool = True):
@@ -325,7 +340,7 @@ class LegalTopicModeling:
             if save_plot:
                 fig1.write_html("bertopic_topics.html")
                 print("📊 BERTopic topics saved as 'bertopic_topics.html'")
-            fig1.show()
+            #fig1.show()
             
             # Topic hierarchy
             hierarchical_topics = topic_model.hierarchical_topics(documents)
@@ -333,14 +348,14 @@ class LegalTopicModeling:
             if save_plot:
                 fig2.write_html("bertopic_hierarchy.html")
                 print("📊 BERTopic hierarchy saved as 'bertopic_hierarchy.html'")
-            fig2.show()
+            #fig2.show()
             
             # Topic heatmap
             fig3 = topic_model.visualize_heatmap()
             if save_plot:
                 fig3.write_html("bertopic_heatmap.html")
                 print("📊 BERTopic heatmap saved as 'bertopic_heatmap.html'")
-            fig3.show()
+            #fig3.show()
             
         except Exception as e:
             print(f"Error creating BERTopic visualizations: {e}")
@@ -379,11 +394,7 @@ class LegalTopicModeling:
             
             for idx in cluster_indices[:3]:  # Get first 3 cases as samples
                 if idx < len(df):
-                    case_info = {
-                        'case_name': df.iloc[idx].get('case_name_short', 'Unknown'),
-                        'court_type': df.iloc[idx].get('court_type', 'Unknown'),
-                        'year': df.iloc[idx].get('decision_date', 'Unknown')
-                    }
+                    case_info = self.clean_case_info(df.iloc[idx])
                     sample_cases.append(case_info)
             
             cluster_analysis['clusters'][cluster_id] = {
@@ -395,6 +406,31 @@ class LegalTopicModeling:
         
         print(f"✓ Clustering complete (Silhouette score: {silhouette_avg:.3f})")
         return cluster_analysis
+    
+    def clean_case_info(self, case_row: pd.Series) -> Dict:
+        """Extract and clean case information from a dataframe row"""
+        try:
+            # Extract relevant information from the case row
+            case_info = {
+                'case_name': str(case_row.get('case_name', 'Unknown')),
+                'court_type': str(case_row.get('court_type', 'Unknown')),
+                'year_filed': str(case_row.get('year_filed', 'Unknown')),
+                'case_id': str(case_row.get('id', case_row.name if hasattr(case_row, 'name') else 'Unknown'))
+            }
+            
+            # Clean up the case name if it's too long
+            if len(case_info['case_name']) > 50:
+                case_info['case_name'] = case_info['case_name'][:47] + "..."
+                
+            return case_info
+        except Exception as e:
+            # Return minimal info if there's an error
+            return {
+                'case_name': 'Error extracting case info',
+                'court_type': 'Unknown',
+                'year_filed': 'Unknown',
+                'case_id': str(case_row.name if hasattr(case_row, 'name') else 'Unknown')
+            }
     
     def save_results(self, lda_topics: List[Dict], cluster_analysis: Dict,
                     bertopic_model: Optional[BERTopic] = None, 
@@ -487,10 +523,12 @@ def main():
         return
     
     # Limit to subset for processing efficiency
-    max_cases = min(500, len(df))
-    df_subset = df.head(max_cases).copy()
-    print(f"Processing {len(df_subset)} cases for topic modeling")
     
+    #max_cases = min(500, len(df))
+    #df_subset = df.head(max_cases).copy()
+    df_subset = df.copy()
+    print(f"Processing {len(df_subset)} cases for topic modeling")
+   # df_subset = df.copy()
     # Prepare documents
     documents = topic_modeler.prepare_documents(df_subset, 'opinion_text')
     
@@ -536,7 +574,7 @@ def main():
         if cluster_info['sample_cases']:
             print("  Sample Cases:")
             for case in cluster_info['sample_cases']:
-                print(f"    - {case['case_name']} ({case['court_type']})")
+                print(f"    - {case['case_name']} ({case['court_type']}, {case['year_filed']})")
     
     # BERTopic Modeling
     if BERTOPIC_AVAILABLE:
@@ -575,6 +613,28 @@ def main():
         n_bertopics = len(bertopic_model.get_topic_info()) - 1  # Exclude outlier topic
         print(f"🤖 Found {n_bertopics} BERTopic topics")
     print(f"🔍 Identified {cluster_analysis['n_clusters']} case clusters")
+    
+    # Force cleanup of parallel processing resources
+    print(f"\n🧹 Cleaning up resources...")
+    try:
+        # Try to access the parallel backend and clean up
+        from joblib._parallel_backends import ThreadingBackend
+        import joblib.parallel
+        
+        # Check if there's an active backend
+        if hasattr(joblib.parallel, '_default_backend'):
+            backend = getattr(joblib.parallel, '_default_backend', None)
+            if backend and hasattr(backend, '_pool') and backend._pool:
+                backend._pool.close()
+                backend._pool.join()
+        
+        # Force garbage collection
+        gc.collect()
+        print(f"✓ Resources cleaned up successfully")
+    except Exception as e:
+        # This is non-critical, so just do garbage collection
+        gc.collect()
+        print(f"✓ Resources cleaned up (basic cleanup only)")
 
 if __name__ == "__main__":
     main()
