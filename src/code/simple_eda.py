@@ -23,7 +23,7 @@ def load_and_analyze_data():
     print("=" * 60)
     
     # Load the dataset
-    file_path = "Text-mining-HTW/data/processed/cleaned/parse_legal_cases.csv"
+    file_path = "/data/processed/cleaned/parse_legal_cases.csv"
     print(f"Loading data from: {file_path}")
     
     try:
