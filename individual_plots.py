@@ -35,7 +35,7 @@ def plot_topics_importance():
     for topic in topics:
         topic_id = topic['topic_id']
         # Use average of top 3 weights as importance score
-        importance = np.mean(topic['weights'][:3])
+        importance = np.mean(topic['weights'][:10])
         topic_importance.append((importance, topic_id, topic['top_words_string']))
     
     # Sort by importance (descending)
@@ -166,8 +166,8 @@ def plot_topic_word_clouds():
         topic_id = topic['topic_id']
         topics_data.append({
             'title': f'#{i+1}: Topic {topic_id}\n({topic["top_words_string"]})',
-            'words': topic['words'][:6],
-            'weights': topic['weights'][:6]
+            'words': topic['words'][:10],
+            'weights': topic['weights'][:10]
         })
     
     fig, axes = plt.subplots(1, 3, figsize=(20, 8))

@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import re
 from typing import List, Dict, Tuple, Optional
-import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
 import json
@@ -14,22 +13,66 @@ warnings.filterwarnings('ignore', category=UserWarning, module='joblib')
 import os
 os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count()))
 
-# For force cleanup
+# For force cleanup and parallel processing
 import gc
 import joblib
+from joblib import Parallel, delayed
+import atexit
+from contextlib import contextmanager
 
-# Text preprocessing
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from sklearn.manifold import TSNE
+# Context manager for proper resource cleanup
+@contextmanager
+def managed_joblib_context():
+    """Context manager that ensures proper cleanup of joblib resources"""
+    try:
+        yield
+    finally:
+        try:
+            # Comprehensive cleanup of joblib/loky resources
+            from joblib.externals import loky
+            
+            # Clean up loky executors
+            if hasattr(loky, 'get_reusable_executor'):
+                try:
+                    executor = loky.get_reusable_executor()
+                    if executor is not None:
+                        executor.shutdown(wait=True)
+                except:
+                    pass
+            
+            # Clean up any process pools
+            if hasattr(loky.process_executor, '_process_pools'):
+                for pool in list(loky.process_executor._process_pools.values()):
+                    try:
+                        pool.shutdown(wait=False)
+                    except:
+                        pass
+                loky.process_executor._process_pools.clear()
+            
+            # Clean up resource tracker
+            try:
+                from joblib.externals.loky.backend import resource_tracker
+                if hasattr(resource_tracker, '_resource_tracker') and resource_tracker._resource_tracker is not None:
+                    resource_tracker._resource_tracker._stop()
+                    resource_tracker._resource_tracker = None
+            except:
+                pass
+            
+            # Force garbage collection
+            gc.collect()
+        except:
+            # Fallback cleanup
+            gc.collect()
+
+# Text preprocessing and machine learning
+from sklearn.feature_extraction.text import CountVectorizer
 import umap
 
 # BERTopic
 try:
     from bertopic import BERTopic
     from sentence_transformers import SentenceTransformer
+    from bertopic.representation import KeyBERTInspired
     BERTOPIC_AVAILABLE = True
     print("✓ BERTopic available")
 except ImportError:
@@ -40,7 +83,7 @@ except ImportError:
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
+from nltk.stem import WordNetLemmatizer, PorterStemmer
 
 try:
     nltk.data.find('tokenizers/punkt')
@@ -53,23 +96,130 @@ except LookupError:
     nltk.download('wordnet', quiet=True)
     nltk.download('averaged_perceptron_tagger', quiet=True)
 
+# Global function for parallel preprocessing with fallback stemmer
+def preprocess_text_parallel(text: str, legal_stopwords: set) -> str:
+    """Standalone function for parallel text preprocessing with fallback stemmer"""
+    if pd.isna(text) or not isinstance(text, str):
+        return ""
+    
+    # Use Porter Stemmer instead of WordNet Lemmatizer for parallel processing
+    # Porter Stemmer is simpler and doesn't have serialization issues
+    stemmer = PorterStemmer()
+    
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Enhanced citation removal patterns
+    text = re.sub(r'\b\d+\s+[a-z\.]+\s*\d+[a-z]*\b', '', text)  # "123 F.3d 456"
+    text = re.sub(r'\b\d{4}\s+[a-z]{2,4}\s+\d+\b', '', text)  # "2023 WL 123456"
+    text = re.sub(r'\b\d+\s+[a-z]{2,4}\s+\d+d\s+\d+\b', '', text)  # "123 Ohio 3d 456"
+    
+    # Remove reporter metadata terms
+    text = re.sub(r'\b(advance sheet|reporter|citation|slip opinion)s?\b', '', text)
+    text = re.sub(r'\b(westlaw|lexis|findlaw)\b', '', text)
+    
+    # Remove state names and common geographic terms to reduce noise
+    us_states = r'\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|hampshire|jersey|mexico|york|carolina|dakota|ohio|oklahoma|oregon|pennsylvania|island|tennessee|texas|utah|vermont|virginia|washington|wisconsin|wyoming)\b'
+    text = re.sub(us_states, '', text)
+    
+    # Remove case names in parentheses
+    text = re.sub(r'\([^)]*v[^)]*\)', '', text)
+    
+    # Remove excessive whitespace and special characters
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Tokenize and stem
+    tokens = word_tokenize(text)
+    
+    # Filter tokens
+    processed_tokens = []
+    for token in tokens:
+        # Skip short tokens and numbers
+        if len(token) < 3 or token.isdigit():
+            continue
+        
+        # Skip stop words
+        if token in legal_stopwords:
+            continue
+        
+        # Stem the token (simpler than lemmatization)
+        stemmed = stemmer.stem(token)
+        processed_tokens.append(stemmed)
+    
+    return ' '.join(processed_tokens)
+
 class LegalTopicModeling:
     """Topic modeling for legal case analysis"""
     
     def __init__(self):
-        self.lemmatizer = WordNetLemmatizer()
-        
-        # Legal-specific stop words
+        # Note: Don't initialize lemmatizer here due to parallel processing issues
+        # Comprehensive legal-specific stop words for better topic quality
         self.legal_stopwords = set(stopwords.words('english')).union({
-            'case', 'court', 'judge', 'plaintiff', 'defendant', 'v', 'vs',
-            'state', 'county', 'city', 'inc', 'corp', 'ltd', 'llc',
-            'opinion', 'decision', 'order', 'holding', 'finding',
-            'section', 'subsection', 'paragraph', 'clause', 'page',
-            'see', 'also', 'however', 'therefore', 'furthermore',
-            'moreover', 'nevertheless', 'accordingly', 'thus',
-            'one', 'two', 'three', 'first', 'second', 'third',
-            'would', 'could', 'should', 'may', 'must', 'shall',
-            'said', 'pursuant', 'herein', 'thereof', 'whereas'
+            # Basic legal terms that appear in all cases
+            'case', 'court', 'judge', 'justice', 'plaintiff', 'defendant', 'v', 'vs', 'versus',
+            'appellant', 'appellee', 'petitioner', 'respondent', 'party', 'parties',
+            
+            # Geographic/jurisdictional terms (often not topic-specific)
+            'state', 'county', 'city', 'district', 'circuit', 'municipal', 'federal',
+            'united', 'states', 'america', 'usa', 'us',
+            
+            # US States to reduce geographic noise
+            'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado',
+            'connecticut', 'delaware', 'florida', 'georgia', 'hawaii', 'idaho',
+            'illinois', 'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana',
+            'maine', 'maryland', 'massachusetts', 'michigan', 'minnesota',
+            'mississippi', 'missouri', 'montana', 'nebraska', 'nevada',
+            'hampshire', 'jersey', 'mexico', 'york', 'carolina', 'dakota',
+            'ohio', 'oklahoma', 'oregon', 'pennsylvania', 'island',
+            'tennessee', 'texas', 'utah', 'vermont', 'virginia',
+            'washington', 'wisconsin', 'wyoming',
+            
+            # Reporter and citation metadata terms
+            'advance', 'sheet', 'reporter', 'citation', 'slip', 'opinion',
+            'westlaw', 'lexis', 'findlaw', 'volume', 'page', 'published',
+            'report', 'cite', 'app', 'tex', 'del', 'ohio', 'st',
+            
+            # Jurisdiction-specific artifacts
+            'commonwealth', 'pcra', 'nebraska', 'pennsylvania', 'texas',
+            'superior', 'appellate', 'supreme', 'dist', 'cir', 'ct',
+            'div', 'dept', 'admin', 'rev', 'supp', 'misc',
+            
+            # Business entities (generic)
+            'inc', 'corp', 'corporation', 'ltd', 'llc', 'company', 'co', 'enterprises',
+            
+            # Legal document structure terms
+            'decision', 'order', 'holding', 'finding', 'conclusion',
+            'section', 'subsection', 'paragraph', 'clause', 'footnote',
+            'exhibit', 'appendix', 'attachment', 'schedule',
+            
+            # Common legal procedure terms (too generic)
+            'motion', 'petition', 'complaint', 'answer', 'brief', 'memorandum',
+            'record', 'transcript', 'hearing', 'trial', 'proceeding',
+            
+            # Legal transitional phrases
+            'see', 'also', 'however', 'therefore', 'furthermore', 'moreover',
+            'nevertheless', 'accordingly', 'thus', 'hence', 'whereas', 'wherein',
+            'herein', 'thereof', 'therefor', 'pursuant', 'notwithstanding',
+            
+            # Numbers and ordinals
+            'one', 'two', 'three', 'four', 'five', 'first', 'second', 'third',
+            'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth',
+            
+            # Legal modals and auxiliaries
+            'would', 'could', 'should', 'may', 'must', 'shall', 'might',
+            'said', 'such', 'same', 'aforesaid', 'aforementioned',
+            
+            # Generic legal actions (too broad)
+            'filed', 'granted', 'denied', 'dismissed', 'reversed', 'affirmed',
+            'remanded', 'vacated', 'stayed', 'enjoined', 'ordered',
+            
+            # Citations and references
+            'id', 'ibid', 'supra', 'infra', 'cf', 'eg', 'ie', 'etc', 'et', 'al',
+            
+            # Time references (often not substantive)
+            'year', 'month', 'day', 'date', 'time', 'period', 'term',
+            'years', 'months', 'days', 'dates', 'times', 'periods', 'terms'
         })
         
         # Legal domain patterns to preserve
@@ -87,12 +237,32 @@ class LegalTopicModeling:
         if pd.isna(text) or not isinstance(text, str):
             return ""
         
+        # Create lemmatizer locally to avoid serialization issues
+        lemmatizer = WordNetLemmatizer()
+        
         # Convert to lowercase
         text = text.lower()
         
-        # Remove citations (e.g., "123 F.3d 456", "2023 WL 123456")
-        text = re.sub(r'\b\d+\s+[a-z\.]+\s*\d+[a-z]*\b', '', text)
-        text = re.sub(r'\b\d{4}\s+[a-z]{2}\s+\d+\b', '', text)
+        # Remove jurisdiction-specific terms and artifacts
+        text = re.sub(r'\b(tex app|ohio st|penn super|del super|commonwealth|pcra)\b', '', text)
+        text = re.sub(r'\b\w{2,}\s+(app|ct|cir|dist|super|supp)\b', '', text)  # "texas app", "ohio ct", etc.
+        
+        # Remove jurisdiction-specific terms and artifacts
+        text = re.sub(r'\b(tex app|ohio st|penn super|del super|commonwealth|pcra)\b', '', text)
+        text = re.sub(r'\b\w{2,}\s+(app|ct|cir|dist|super|supp)\b', '', text)  # "texas app", "ohio ct", etc.
+        
+        # Enhanced citation removal patterns
+        text = re.sub(r'\b\d+\s+[a-z\.]+\s*\d+[a-z]*\b', '', text)  # "123 F.3d 456"
+        text = re.sub(r'\b\d{4}\s+[a-z]{2,4}\s+\d+\b', '', text)  # "2023 WL 123456"
+        text = re.sub(r'\b\d+\s+[a-z]{2,4}\s+\d+d\s+\d+\b', '', text)  # "123 Ohio 3d 456"
+        
+        # Remove reporter metadata terms
+        text = re.sub(r'\b(advance sheet|reporter|citation|slip opinion)s?\b', '', text)
+        text = re.sub(r'\b(westlaw|lexis|findlaw)\b', '', text)
+        
+        # Remove state names and common geographic terms to reduce noise
+        us_states = r'\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|hampshire|jersey|mexico|york|carolina|dakota|ohio|oklahoma|oregon|pennsylvania|island|tennessee|texas|utah|vermont|virginia|washington|wisconsin|wyoming)\b'
+        text = re.sub(us_states, '', text)
         
         # Remove case names in parentheses
         text = re.sub(r'\([^)]*v[^)]*\)', '', text)
@@ -116,217 +286,552 @@ class LegalTopicModeling:
                 continue
             
             # Lemmatize
-            lemmatized = self.lemmatizer.lemmatize(token)
+            lemmatized = lemmatizer.lemmatize(token)
             processed_tokens.append(lemmatized)
         
         return ' '.join(processed_tokens)
     
-    def prepare_documents(self, df: pd.DataFrame, text_column: str = 'opinion_text') -> List[str]:
-        """Prepare documents for topic modeling"""
-        print("📝 Preprocessing documents...")
+    def prepare_documents(self, df: pd.DataFrame, text_column: str = 'opinion_text', 
+                         cache_file: str = 'data/processed/preprocessed_docs.pkl', 
+                         force_reprocess: bool = False) -> List[str]:
+        """Prepare documents for topic modeling with high-quality preprocessing"""
+        import pickle
+        import os
         
+        # Option to force reprocessing (useful when changing preprocessing algorithms)
+        if force_reprocess and os.path.exists(cache_file):
+            print(f"🔄 Force reprocessing - removing cache: {cache_file}")
+            os.remove(cache_file)
+        
+        # Check if cached preprocessed documents exist
+        if os.path.exists(cache_file):
+            print(f"📁 Loading preprocessed documents from cache: {cache_file}")
+            try:
+                with open(cache_file, 'rb') as f:
+                    documents = pickle.load(f)
+                print(f"✓ Loaded {len(documents)} documents from cache")
+                return documents
+            except Exception as e:
+                print(f"⚠️ Failed to load cache: {e}. Reprocessing...")
+        
+        print("📝 Preprocessing documents with high-quality lemmatization...")
+        print("ℹ️  Using WordNet Lemmatizer for proper word forms (slower but better quality)")
+        
+        all_texts = df[text_column].tolist()
         documents = []
-        for idx, text in enumerate(df[text_column]):
+        
+        # Use sequential processing with WordNet Lemmatizer for better quality
+        for idx, text in enumerate(all_texts):
             processed = self.preprocess_text(text)
-            if len(processed.split()) > 10:  # Filter very short documents
-                documents.append(processed)
+            
+            # Additional noise filtering for LDA
+            tokens = processed.split()
+            
+            # Filter out HTML artifacts and encoding issues
+            clean_tokens = []
+            for token in tokens:
+                # Skip HTML artifacts
+                if any(artifact in token for artifact in ['quot', 'x27', 'amp', 'lt', 'gt']):
+                    continue
+                # Skip common names/locations that create noise topics
+                if token in {'miller', 'smith', 'jones', 'brown', 'davis', 'wilson', 'moore', 'taylor', 'anderson', 'thomas',
+                           'north', 'south', 'east', 'west', 'los', 'san', 'new', 'que', 'del', 'las', 'des'}:
+                    continue
+                # Skip very short or numeric tokens
+                if len(token) < 3 or token.isdigit():
+                    continue
+                clean_tokens.append(token)
+            
+            cleaned_processed = ' '.join(clean_tokens)
+            if len(clean_tokens) > 10:
+                documents.append(cleaned_processed)
             
             if (idx + 1) % 100 == 0:
                 print(f"Processed {idx + 1} documents...")
         
+        # Cache the preprocessed documents
+        if documents:  # Only cache if we have documents
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(documents, f)
+                print(f"💾 Cached preprocessed documents to: {cache_file}")
+            except Exception as e:
+                print(f"⚠️ Failed to cache documents: {e}")
+        
         print(f"✓ Prepared {len(documents)} documents for topic modeling")
         return documents
     
-    def fit_lda_model(self, documents: List[str], n_topics: int = 10, 
-                      max_features: int = 1000) -> Tuple[LatentDirichletAllocation, CountVectorizer, np.ndarray]:
-        """Fit LDA topic model"""
-        print(f"🔍 Fitting LDA model with {n_topics} topics...")
-        
-        # Vectorize documents
-        vectorizer = CountVectorizer(
-            max_features=max_features,
-            min_df=2,
-            max_df=0.8,
-            stop_words='english',
-            ngram_range=(1, 2)
-        )
-        
-        doc_term_matrix = vectorizer.fit_transform(documents)
-        
-        # Fit LDA
-        lda = LatentDirichletAllocation(
-            n_components=n_topics,
-            random_state=42,
-            max_iter=100,
-            learning_method='online',
-            learning_offset=50.0
-        )
-        
-        lda_output = lda.fit_transform(doc_term_matrix)
-        
-        print("✓ LDA model fitted successfully")
-        return lda, vectorizer, lda_output
     
-    def get_lda_topics(self, lda: LatentDirichletAllocation, 
-                       vectorizer: CountVectorizer, n_words: int = 10) -> List[Dict]:
-        """Extract topics from LDA model"""
-        try:
-            # Try the newer method first
-            feature_names = vectorizer.get_feature_names_out()
-        except AttributeError:
-            # Fall back to older method for older sklearn versions
-            feature_names = vectorizer.get_feature_names()
+    def prepare_documents_for_bertopic(self, df: pd.DataFrame, text_column: str = 'opinion_text') -> List[str]:
+        """Prepare documents for BERTopic with legal-optimized preprocessing"""
+        print("📝 Preparing documents for BERTopic (legal-optimized preprocessing)...")
         
-        topics = []
-        
-        for topic_idx, topic in enumerate(lda.components_):
-            top_words_idx = topic.argsort()[-n_words:][::-1]
-            top_words = [feature_names[i] for i in top_words_idx]
-            top_weights = [topic[i] for i in top_words_idx]
+        documents = []
+        for idx, text in enumerate(df[text_column]):
+            if pd.isna(text) or not isinstance(text, str):
+                continue
             
-            topics.append({
-                'topic_id': topic_idx,
-                'words': top_words,
-                'weights': top_weights,
-                'top_words_string': ', '.join(top_words[:5])
-            })
+            # Enhanced preprocessing for better legal topic extraction
+            processed = text.lower()
+            
+            # Preserve key legal phrases before token filtering
+            legal_phrases = [
+                'summary judgment', 'due process', 'probable cause', 'search warrant',
+                'miranda rights', 'habeas corpus', 'class action', 'preliminary injunction',
+                'temporary restraining', 'punitive damages', 'attorney fees', 'motion dismiss',
+                'personal jurisdiction', 'subject matter jurisdiction', 'res judicata',
+                'collateral estoppel', 'statute limitations', 'qualified immunity',
+                'sovereign immunity', 'commerce clause', 'equal protection', 'first amendment',
+                'fourth amendment', 'fifth amendment', 'fourteenth amendment',
+                'breach contract', 'specific performance', 'injunctive relief',
+                'criminal law', 'civil procedure', 'constitutional law', 'contract law',
+                'tort law', 'property law', 'family law', 'employment law'
+            ]
+            
+            # Replace phrases with underscore versions to preserve them
+            phrase_map = {}
+            for phrase in legal_phrases:
+                if phrase in processed:
+                    underscore_phrase = phrase.replace(' ', '_')
+                    phrase_map[underscore_phrase] = phrase
+                    processed = processed.replace(phrase, underscore_phrase)
+            
+            # Remove legal citations more comprehensively
+            processed = re.sub(r'\b\d+\s+[a-z\.]+\s*\d+[a-z]*\b', '', processed)  # e.g., "123 F.3d 456"
+            processed = re.sub(r'\b\d{4}\s+[a-z]{2,4}\s+\d+\b', '', processed)    # e.g., "2023 WL 123456"
+            processed = re.sub(r'\b\d+\s+[a-z]{2,4}\s+\d+d\s+\d+\b', '', processed)  # e.g., "123 Ohio 3d 456"
+            
+            # Remove case names and party references
+            processed = re.sub(r'\([^)]*v\.?\s+[^)]*\)', '', processed)             # Case names in parens
+            processed = re.sub(r'\b[a-z]+\s+v\.?\s+[a-z]+\b', '', processed)       # Simple "A v. B" patterns
+            
+            # Remove court-specific abbreviations that create noise topics
+            processed = re.sub(r'\b(dist|cir|app|ct|sup|fed|admin)\b\.?', '', processed)
+            processed = re.sub(r'\b\d+(st|nd|rd|th)\s+(dist|cir|app|ct)\b\.?', '', processed)
+            
+            # Remove excessive punctuation and normalize spaces
+            processed = re.sub(r'[^\w\s_]', ' ', processed)  # Keep underscores for phrases
+            processed = re.sub(r'\s+', ' ', processed).strip()
+            
+            # Filter out very short tokens that don't add semantic value
+            tokens = processed.split()
+            filtered_tokens = [token for token in tokens if len(token) > 2 and not token.isdigit()]
+            
+            # Remove legal stopwords but preserve legal phrases
+            meaningful_tokens = []
+            for token in filtered_tokens:
+                if token in phrase_map:  # It's a preserved legal phrase
+                    meaningful_tokens.append(token)
+                elif token not in self.legal_stopwords:
+                    meaningful_tokens.append(token)
+            
+            # Restore original phrases
+            processed_doc = ' '.join(meaningful_tokens)
+            for underscore_phrase, original_phrase in phrase_map.items():
+                processed_doc = processed_doc.replace(underscore_phrase, original_phrase)
+            
+            # Keep documents with substantial meaningful content
+            if len(meaningful_tokens) > 25:  # Slightly lower threshold to include more documents
+                documents.append(processed_doc)
+            
+            if (idx + 1) % 100 == 0:
+                print(f"Processed {idx + 1} documents for BERTopic...")
         
-        return topics
+        print(f"✓ Prepared {len(documents)} documents for BERTopic with enhanced preprocessing")
+        return documents
     
-    def fit_bertopic_model(self, documents: List[str], min_topic_size: int = 10) -> Optional[BERTopic]:
-        """Fit BERTopic model"""
+    def preprocess_text_for_bertopic(self, text: str) -> str:
+        """Preprocess legal text specifically for BERTopic with legal phrase preservation"""
+        if pd.isna(text) or not isinstance(text, str):
+            return ""
+        
+        # Enhanced preprocessing for better legal topic extraction
+        processed = text.lower()
+        
+        # Preserve key legal phrases before token filtering
+        legal_phrases = [
+            'summary judgment', 'due process', 'probable cause', 'search warrant',
+            'miranda rights', 'habeas corpus', 'class action', 'preliminary injunction',
+            'temporary restraining', 'punitive damages', 'attorney fees', 'motion dismiss',
+            'personal jurisdiction', 'subject matter jurisdiction', 'res judicata',
+            'collateral estoppel', 'statute limitations', 'qualified immunity',
+            'sovereign immunity', 'commerce clause', 'equal protection', 'first amendment',
+            'fourth amendment', 'fifth amendment', 'fourteenth amendment',
+            'breach contract', 'specific performance', 'injunctive relief',
+            'criminal law', 'civil procedure', 'constitutional law', 'contract law',
+            'tort law', 'property law', 'family law', 'employment law'
+        ]
+        
+        # Replace phrases with underscore versions to preserve them
+        phrase_map = {}
+        for phrase in legal_phrases:
+            if phrase in processed:
+                underscore_phrase = phrase.replace(' ', '_')
+                phrase_map[underscore_phrase] = phrase
+                processed = processed.replace(phrase, underscore_phrase)
+        
+        # Remove legal citations more comprehensively
+        processed = re.sub(r'\b\d+\s+[a-z\.]+\s*\d+[a-z]*\b', '', processed)  # e.g., "123 F.3d 456"
+        processed = re.sub(r'\b\d{4}\s+[a-z]{2,4}\s+\d+\b', '', processed)    # e.g., "2023 WL 123456"
+        processed = re.sub(r'\b\d+\s+[a-z]{2,4}\s+\d+d\s+\d+\b', '', processed)  # e.g., "123 Ohio 3d 456"
+        
+        # Remove case names and party references
+        processed = re.sub(r'\([^)]*v\.?\s+[^)]*\)', '', processed)             # Case names in parens
+        processed = re.sub(r'\b[a-z]+\s+v\.?\s+[a-z]+\b', '', processed)       # Simple "A v. B" patterns
+        
+        # Remove court-specific abbreviations that create noise topics
+        processed = re.sub(r'\b(dist|cir|app|ct|sup|fed|admin)\b\.?', '', processed)
+        processed = re.sub(r'\b\d+(st|nd|rd|th)\s+(dist|cir|app|ct)\b\.?', '', processed)
+        
+        # Remove excessive punctuation and normalize spaces
+        processed = re.sub(r'[^\w\s_]', ' ', processed)  # Keep underscores for phrases
+        processed = re.sub(r'\s+', ' ', processed).strip()
+        
+        # Filter out very short tokens that don't add semantic value
+        tokens = processed.split()
+        filtered_tokens = [token for token in tokens if len(token) > 2 and not token.isdigit()]
+        
+        # Remove legal stopwords but preserve legal phrases
+        meaningful_tokens = []
+        for token in filtered_tokens:
+            if token in phrase_map:  # It's a preserved legal phrase
+                meaningful_tokens.append(token)
+            elif token not in self.legal_stopwords:
+                meaningful_tokens.append(token)
+        
+        # Restore original phrases
+        processed_doc = ' '.join(meaningful_tokens)
+        for underscore_phrase, original_phrase in phrase_map.items():
+            processed_doc = processed_doc.replace(underscore_phrase, original_phrase)
+        
+        return processed_doc
+
+    def fit_bertopic_model_with_optimization(self, documents: List[str], data_size: int = None, max_iterations: int = 3) -> Optional[BERTopic]:
+        """Fit BERTopic model with automatic optimization to prevent dominant topics"""
         if not BERTOPIC_AVAILABLE:
             print("❌ BERTopic not available")
             return None
         
-        print(f"🤖 Fitting BERTopic model...")
+        # Check minimum dataset size
+        if len(documents) < 20:
+            print(f"⚠️ Dataset too small for BERTopic ({len(documents)} docs). Need at least 20 documents.")
+            return None
         
-        # Initialize sentence transformer
-        sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Use the best performing parameters from optimization
+        best_params = {'min_topic_size': 28, 'n_components': 8, 'n_neighbors': 12}
+        print(f"🎯 Using optimized parameters: {best_params}")
         
-        # Initialize BERTopic with UMAP and HDBSCAN
-        topic_model = BERTopic(
-            embedding_model=sentence_model,
-            min_topic_size=min_topic_size,
-            calculate_probabilities=True,
-            verbose=True
+        model = self.fit_single_bertopic_model(
+            documents, 
+            data_size, 
+            min_topic_size=best_params['min_topic_size'],
+            n_components=best_params['n_components'], 
+            n_neighbors=best_params['n_neighbors']
         )
         
-        # Fit model
-        topics, probs = topic_model.fit_transform(documents)
+        if model is not None:
+            # Evaluate the final model
+            topics, _ = model.fit_transform(documents)
+            quality_metrics = self.evaluate_topic_quality(model, documents, topics)
+            print(f"📊 Final Model Quality Score: {quality_metrics['overall_score']:.1f}/100")
         
-        print(f"✓ BERTopic model fitted with {len(set(topics))} topics")
-        return topic_model
-    
-    def analyze_topic_coherence(self, lda: LatentDirichletAllocation, 
-                               doc_term_matrix, n_topics_range: range = range(5, 21)) -> Dict:
-        """Analyze topic coherence for different numbers of topics"""
-        print("📊 Analyzing topic coherence...")
+        return model
+
+    def fit_single_bertopic_model(self, documents: List[str], data_size: int = None, 
+                                 min_topic_size: int = 10, n_components: int = 12, 
+                                 n_neighbors: int = 8) -> Optional[BERTopic]:
+        """Fit a single BERTopic model with specified parameters"""
+        if not BERTOPIC_AVAILABLE:
+            print("❌ BERTopic not available")
+            return None
         
-        coherence_scores = []
-        perplexity_scores = []
+        if data_size is None:
+            data_size = len(documents)
         
-        for n_topics in n_topics_range:
-            lda_temp = LatentDirichletAllocation(
-                n_components=n_topics,
-                random_state=42,
-                max_iter=50
+        print(f"🤖 Fitting BERTopic model with min_topic_size={min_topic_size}...")
+        
+        # Use legal-BERT model for better legal text understanding
+        try:
+            # Try to load a legal-specific model - using a known working legal model
+            print("🔍 Attempting to load legal-BERT model...")
+            
+            # Try different legal BERT model options (sentence-transformers compatible)
+            legal_models = [
+                'sentence-transformers/all-mpnet-base-v2',  # Best general model for semantic search
+                'sentence-transformers/all-MiniLM-L12-v2',  # Good balance of speed/quality
+                'sentence-transformers/all-MiniLM-L6-v2',   # Faster, still good quality
+                'nlpaueb/legal-bert-base-uncased'  # Legal BERT (will auto-create pooling)
+            ]
+            
+            sentence_model = None
+            for model_name in legal_models:
+                try:
+                    print(f"🔍 Trying {model_name}...")
+                    sentence_model = SentenceTransformer(model_name)
+                    print(f"✓ Successfully loaded {model_name}")
+                    break
+                except Exception as e:
+                    print(f"⚠️ Failed to load {model_name}: {e}")
+                    continue
+            
+            # If no legal model works, use general model
+            if sentence_model is None:
+                raise Exception("No legal BERT models available")
+                
+        except Exception as e:
+            print(f"⚠️ Legal BERT models not available: {e}")
+            # Fallback to all-MiniLM-L6-v2
+            try:
+                print("🔄 Falling back to all-MiniLM-L6-v2...")
+                sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+                print("✓ Using all-MiniLM-L6-v2 as fallback")
+            except Exception as e2:
+                print(f"⚠️ Failed to load fallback model: {e2}")
+                return None
+        
+        # Optimized vectorizer parameters to prevent topic dominance
+        print(f"📊 Processing {data_size} documents, {len(documents)} preprocessed documents")
+        
+        num_docs = len(documents)
+        
+        # More restrictive parameters to create balanced topics
+        if num_docs < 50:
+            min_df = 1
+            max_df = max(2, int(num_docs * 0.8))  # More restrictive max_df
+            max_features = min(150, num_docs * 4)
+        elif num_docs < 100:
+            min_df = 1
+            max_df = max(3, int(num_docs * 0.7))  # More restrictive
+            max_features = min(300, num_docs * 6)
+        elif num_docs < 200:
+            min_df = 2
+            max_df = max(5, int(num_docs * 0.6))  # More restrictive
+            max_features = min(500, num_docs * 8)
+        elif num_docs < 500:
+            min_df = 2
+            max_df = 0.5  # Much more restrictive to prevent common words dominating
+            max_features = 800
+        elif num_docs < 1000:
+            min_df = 3
+            max_df = 0.4  # Very restrictive
+            max_features = 1500
+        else:
+            min_df = 3
+            max_df = 0.35  # Very restrictive to force topic specialization
+            max_features = 2500
+        
+        print(f"📊 Vectorizer settings: min_df={min_df}, max_df={max_df}, max_features={max_features}")
+        
+        # Optimized vectorizer for legal text with legal phrases
+        vectorizer_model = CountVectorizer(
+            ngram_range=(1, 3),  # Include 3-grams for complex legal phrases
+            stop_words=list(self.legal_stopwords),  # Use our comprehensive legal stopwords
+            min_df=min_df,
+            max_df=max_df,
+            max_features=max_features,
+            lowercase=True,
+            token_pattern=r'\b[a-zA-Z]{3,}\b',  # Only words with 3+ characters
+            analyzer='word',
+            strip_accents='unicode'
+        )
+        
+        # Set up UMAP for better dimensionality reduction
+        try:
+            import umap
+            # More aggressive UMAP parameters to prevent dominant clusters
+            umap_model = umap.UMAP(
+                n_neighbors=n_neighbors,
+                n_components=n_components,
+                min_dist=0.1,
+                metric='cosine',
+                spread=1.5,
+                random_state=42
             )
-            lda_temp.fit(doc_term_matrix)
+            print("✓ Using optimized UMAP parameters")
+        except ImportError:
+            umap_model = None
+            print("⚠️ UMAP not available, using default dimensionality reduction")
+        
+        # Set up HDBSCAN for better clustering
+        try:
+            import hdbscan
+            # More sensitive HDBSCAN to create balanced clusters
+            hdbscan_model = hdbscan.HDBSCAN(
+                min_cluster_size=min_topic_size,
+                min_samples=max(2, min_topic_size // 3),  # Adaptive min_samples
+                metric='euclidean',
+                cluster_selection_method='leaf',  # More sensitive to smaller clusters
+                alpha=1.5,  # Higher alpha for more conservative clustering
+                prediction_data=True
+            )
+            print(f"✓ Using HDBSCAN with min_cluster_size={min_topic_size}")
+        except ImportError:
+            hdbscan_model = None
+            print("⚠️ HDBSCAN not available, using default clustering")
+        
+        # Set up KeyBERTInspired for better keyword quality
+        try:
+            representation_model = KeyBERTInspired()
+            print("✓ Using KeyBERTInspired for better keyword quality")
+        except:
+            representation_model = None
+            print("⚠️ KeyBERTInspired not available, using default representation")
+        
+        # Force more topics to prevent dominance
+        target_topics = max(8, min(25, data_size // 150))  # Adaptive topic count
+        print(f"🎯 Target number of topics: {target_topics}")
+        
+        # Initialize BERTopic with optimized parameters for legal text
+        topic_model_params = {
+            "language": "english",
+            "embedding_model": sentence_model,
+            "vectorizer_model": vectorizer_model,
+            "calculate_probabilities": True,
+            "verbose": True,
+            "nr_topics": target_topics  # Force specific number of topics
+        }
+        
+        if representation_model is not None:
+            topic_model_params["representation_model"] = representation_model
+        
+        if umap_model is not None:
+            topic_model_params["umap_model"] = umap_model
+        
+        if hdbscan_model is not None:
+            topic_model_params["hdbscan_model"] = hdbscan_model
+        else:
+            topic_model_params["min_topic_size"] = min_topic_size
+        
+        topic_model = BERTopic(**topic_model_params)
+        
+        # Fit model with error handling
+        print("🔄 Training BERTopic model...")
+        try:
+            topics, probs = topic_model.fit_transform(documents)
             
-            perplexity = lda_temp.perplexity(doc_term_matrix)
-            perplexity_scores.append(perplexity)
+            n_topics = len(set(topics))
+            n_outliers = sum(1 for t in topics if t == -1)
             
+            print(f"✅ BERTopic model training complete!")
+            print(f"📊 Found {n_topics} topics ({n_outliers} outlier documents)")
+            
+            return topic_model
+            
+        except Exception as e:
+            print(f"❌ Error training BERTopic model: {e}")
+            return None
+
+    def evaluate_topic_quality(self, topic_model: BERTopic, documents: List[str], topics: List[int]):
+        """Evaluate the quality of generated topics for legal text"""
+        print("\n🔍 EVALUATING TOPIC QUALITY:")
+        
+        topic_info = topic_model.get_topic_info()
+        total_topics = len(topic_info) - 1  # Exclude outlier topic (-1)
+        
+        # 1. Topic Balance Analysis
+        topic_counts = Counter(topics)
+        topic_sizes = [topic_counts[i] for i in range(0, total_topics)]
+        
+        if topic_sizes:
+            largest_topic_pct = max(topic_sizes) / len(documents) * 100
+            smallest_topic_pct = min(topic_sizes) / len(documents) * 100
+            
+            print(f"📊 Topic Balance:")
+            print(f"   • Total topics: {total_topics}")
+            print(f"   • Largest topic covers: {largest_topic_pct:.1f}% of documents")
+            print(f"   • Smallest topic covers: {smallest_topic_pct:.1f}% of documents")
+            
+            if largest_topic_pct > 35:
+                print(f"   ⚠️  Warning: Largest topic is too dominant ({largest_topic_pct:.1f}%)")
+            else:
+                print(f"   ✓ Good topic balance")
+        
+        # 2. Legal Domain Analysis
+        legal_domains = {
+            'criminal': ['criminal', 'sentence', 'plea', 'defendant', 'prosecution', 'guilty', 'conviction'],
+            'civil': ['civil', 'damages', 'liability', 'negligence', 'tort', 'plaintiff'],
+            'contract': ['contract', 'agreement', 'breach', 'performance', 'consideration'],
+            'property': ['property', 'real estate', 'lease', 'landlord', 'tenant', 'ownership'],
+            'family': ['custody', 'divorce', 'marriage', 'child', 'parent', 'support'],
+            'constitutional': ['constitutional', 'amendment', 'rights', 'freedom', 'due process'],
+            'employment': ['employment', 'employee', 'employer', 'workplace', 'discrimination'],
+            'corporate': ['corporation', 'shareholder', 'director', 'securities', 'merger']
+        }
+        
+        domain_topics = {}
+        print(f"\n🏛️ Legal Domain Coverage:")
+        
+        for topic_id in range(min(10, total_topics)):  # Check top 10 topics
+            topic_words = [word for word, _ in topic_model.get_topic(topic_id)[:10]]
+            topic_words_str = ', '.join(topic_words[:5])
+            
+            # Find matching legal domains
+            matching_domains = []
+            for domain, keywords in legal_domains.items():
+                if any(keyword in ' '.join(topic_words) for keyword in keywords):
+                    matching_domains.append(domain)
+            
+            if matching_domains:
+                domain_topics[topic_id] = matching_domains
+                print(f"   Topic {topic_id}: {topic_words_str} → {', '.join(matching_domains)}")
+            else:
+                print(f"   Topic {topic_id}: {topic_words_str} → [Unclear domain]")
+        
+        # 3. Topic Coherence Assessment
+        coherent_topics = 0
+        print(f"\n🎯 Topic Coherence Assessment:")
+        
+        for topic_id in range(min(5, total_topics)):  # Check top 5 topics
+            topic_words = [word for word, _ in topic_model.get_topic(topic_id)[:8]]
+            
+            # Simple coherence check: do words relate to similar legal concepts?
+            if len(set(topic_words).intersection(set([
+                # Group related legal terms
+                'sentence', 'plea', 'criminal', 'defendant',  # Criminal
+                'contract', 'agreement', 'breach', 'performance',  # Contract
+                'property', 'lease', 'tenant', 'landlord',  # Property
+                'custody', 'child', 'parent', 'family'  # Family
+            ]))) >= 2:
+                coherent_topics += 1
+                print(f"   ✓ Topic {topic_id}: Coherent ({', '.join(topic_words[:4])})")
+            else:
+                print(f"   ? Topic {topic_id}: Mixed ({', '.join(topic_words[:4])})")
+        
+        # 4. Overall Quality Score
+        balance_score = min(100, (100 - largest_topic_pct + 10)) if topic_sizes else 50
+        domain_score = len(domain_topics) / min(10, total_topics) * 100
+        coherence_score = coherent_topics / min(5, total_topics) * 100
+        
+        overall_score = (balance_score + domain_score + coherence_score) / 3
+        
+        print(f"\n📈 QUALITY METRICS:")
+        print(f"   • Balance Score: {balance_score:.1f}/100")
+        print(f"   • Domain Coverage: {domain_score:.1f}/100")
+        print(f"   • Coherence Score: {coherence_score:.1f}/100")
+        print(f"   • Overall Quality: {overall_score:.1f}/100")
+        
+        if overall_score >= 75:
+            print("   🎉 Excellent topic quality!")
+        elif overall_score >= 60:
+            print("   👍 Good topic quality")
+        elif overall_score >= 45:
+            print("   ⚠️  Fair topic quality - consider parameter tuning")
+        else:
+            print("   ❌ Poor topic quality - model needs optimization")
+        
         return {
-            'n_topics': list(n_topics_range),
-            'perplexity_scores': perplexity_scores
+            'total_topics': total_topics,
+            'balance_score': balance_score,
+            'domain_score': domain_score,
+            'coherence_score': coherence_score,
+            'overall_score': overall_score,
+            'domain_topics': domain_topics
         }
     
-    def visualize_lda_topics(self, topics: List[Dict], save_plot: bool = True):
-        """Visualize LDA topics"""
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # 1. Topic word clouds (top words bar chart)
-        n_topics_to_show = min(4, len(topics))
-        for i in range(n_topics_to_show):
-            ax = axes[i//2, i%2]
-            topic = topics[i]
-            
-            words = topic['words'][:8]
-            weights = topic['weights'][:8]
-            
-            ax.barh(words, weights)
-            ax.set_title(f'Topic {i}: {topic["top_words_string"]}', fontsize=12)
-            ax.set_xlabel('Weight')
-        
-        plt.tight_layout()
-        
-        if save_plot:
-            plt.savefig('lda_topics.png', dpi=300, bbox_inches='tight')
-            print("📊 LDA topics visualization saved as 'lda_topics.png'")
-        
-        #plt.show()
     
-    def visualize_topic_distribution(self, lda_output: np.ndarray, topics: List[Dict], 
-                                   save_plot: bool = True):
-        """Visualize topic distribution across documents"""
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # 1. Average topic weights
-        avg_weights = np.mean(lda_output, axis=0)
-        topic_labels = [f"T{i}: {topics[i]['top_words_string'][:20]}..." 
-                       for i in range(len(topics))]
-        
-        axes[0, 0].bar(range(len(avg_weights)), avg_weights)
-        axes[0, 0].set_title('Average Topic Weights Across Documents')
-        axes[0, 0].set_xlabel('Topic')
-        axes[0, 0].set_ylabel('Average Weight')
-        axes[0, 0].set_xticks(range(len(topic_labels)))
-        axes[0, 0].set_xticklabels([f"T{i}" for i in range(len(topics))], rotation=45)
-        
-        # 2. Topic distribution heatmap
-        if lda_output.shape[0] > 20:
-            sample_docs = lda_output[:20]  # Show first 20 documents
-        else:
-            sample_docs = lda_output
-        
-        im = axes[0, 1].imshow(sample_docs.T, cmap='Blues', aspect='auto')
-        axes[0, 1].set_title('Topic Distribution Across Sample Documents')
-        axes[0, 1].set_xlabel('Document')
-        axes[0, 1].set_ylabel('Topic')
-        plt.colorbar(im, ax=axes[0, 1])
-        
-        # 3. Document-topic assignment (dominant topic)
-        dominant_topics = np.argmax(lda_output, axis=1)
-        topic_counts = Counter(dominant_topics)
-        
-        topics_list = list(topic_counts.keys())
-        counts_list = list(topic_counts.values())
-        
-        axes[1, 0].bar(topics_list, counts_list)
-        axes[1, 0].set_title('Document Count by Dominant Topic')
-        axes[1, 0].set_xlabel('Topic')
-        axes[1, 0].set_ylabel('Number of Documents')
-        
-        # 4. Topic coherence distribution
-        topic_coherences = []
-        for i in range(lda_output.shape[1]):
-            topic_docs = lda_output[:, i]
-            coherence = np.std(topic_docs)  # Simple coherence measure
-            topic_coherences.append(coherence)
-        
-        axes[1, 1].bar(range(len(topic_coherences)), topic_coherences)
-        axes[1, 1].set_title('Topic Coherence (Standard Deviation)')
-        axes[1, 1].set_xlabel('Topic')
-        axes[1, 1].set_ylabel('Coherence Score')
-        
-        plt.tight_layout()
-        
-        if save_plot:
-            plt.savefig('topic_distribution.png', dpi=300, bbox_inches='tight')
-            print("📊 Topic distribution saved as 'topic_distribution.png'")
-        
-        #plt.show()
+    
+
     
     def visualize_bertopic_results(self, topic_model: BERTopic, documents: List[str], 
                                  save_plot: bool = True):
@@ -360,129 +865,15 @@ class LegalTopicModeling:
         except Exception as e:
             print(f"Error creating BERTopic visualizations: {e}")
     
-    def cluster_similar_cases(self, lda_output: np.ndarray, df: pd.DataFrame, 
-                            n_clusters: int = 5) -> Dict:
-        """Cluster cases based on topic distributions"""
-        print(f"🔍 Clustering cases into {n_clusters} clusters...")
-        
-        # K-means clustering on topic distributions
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        cluster_labels = kmeans.fit_predict(lda_output)
-        
-        # Calculate silhouette score
-        silhouette_avg = silhouette_score(lda_output, cluster_labels)
-        
-        # Analyze clusters
-        cluster_analysis = {
-            'n_clusters': n_clusters,
-            'silhouette_score': silhouette_avg,
-            'cluster_sizes': Counter(cluster_labels),
-            'clusters': {}
-        }
-        
-        for cluster_id in range(n_clusters):
-            cluster_mask = cluster_labels == cluster_id
-            cluster_docs = lda_output[cluster_mask]
-            
-            # Get cluster characteristics
-            avg_topic_dist = np.mean(cluster_docs, axis=0)
-            dominant_topic = np.argmax(avg_topic_dist)
-            
-            # Get sample cases from this cluster
-            cluster_indices = np.where(cluster_mask)[0]
-            sample_cases = []
-            
-            for idx in cluster_indices[:3]:  # Get first 3 cases as samples
-                if idx < len(df):
-                    case_info = self.clean_case_info(df.iloc[idx])
-                    sample_cases.append(case_info)
-            
-            cluster_analysis['clusters'][cluster_id] = {
-                'size': int(np.sum(cluster_mask)),
-                'dominant_topic': int(dominant_topic),
-                'avg_topic_distribution': avg_topic_dist.tolist(),
-                'sample_cases': sample_cases
-            }
-        
-        print(f"✓ Clustering complete (Silhouette score: {silhouette_avg:.3f})")
-        return cluster_analysis
+
     
-    def clean_case_info(self, case_row: pd.Series) -> Dict:
-        """Extract and clean case information from a dataframe row"""
-        try:
-            # Extract relevant information from the case row
-            case_info = {
-                'case_name': str(case_row.get('case_name', 'Unknown')),
-                'court_type': str(case_row.get('court_type', 'Unknown')),
-                'year_filed': str(case_row.get('year_filed', 'Unknown')),
-                'case_id': str(case_row.get('id', case_row.name if hasattr(case_row, 'name') else 'Unknown'))
-            }
-            
-            # Clean up the case name if it's too long
-            if len(case_info['case_name']) > 50:
-                case_info['case_name'] = case_info['case_name'][:47] + "..."
-                
-            return case_info
-        except Exception as e:
-            # Return minimal info if there's an error
-            return {
-                'case_name': 'Error extracting case info',
-                'court_type': 'Unknown',
-                'year_filed': 'Unknown',
-                'case_id': str(case_row.name if hasattr(case_row, 'name') else 'Unknown')
-            }
     
-    def save_results(self, lda_topics: List[Dict], cluster_analysis: Dict,
-                    bertopic_model: Optional[BERTopic] = None, 
+    def save_results(self, bertopic_model: Optional[BERTopic] = None, 
                     output_dir: str = "data/processed/"):
-        """Save topic modeling results"""
+        """Save BERTopic modeling results"""
         import os
         
         os.makedirs(output_dir, exist_ok=True)
-        
-        def convert_numpy_types(obj):
-            """Convert numpy types to Python native types for JSON serialization"""
-            if isinstance(obj, dict):
-                return {str(k): convert_numpy_types(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_numpy_types(v) for v in obj]
-            elif isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                # Handle NaN values
-                if np.isnan(obj):
-                    return None
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                # Handle NaN values in arrays
-                clean_array = obj.tolist()
-                return clean_nan_values(clean_array)
-            elif obj is np.nan or (isinstance(obj, float) and np.isnan(obj)):
-                return None
-            else:
-                return obj
-        
-        def clean_nan_values(obj):
-            """Recursively clean NaN values from nested structures"""
-            if isinstance(obj, list):
-                return [clean_nan_values(item) for item in obj]
-            elif isinstance(obj, dict):
-                return {k: clean_nan_values(v) for k, v in obj.items()}
-            elif isinstance(obj, float) and np.isnan(obj):
-                return None
-            else:
-                return obj
-        
-        # Convert numpy types in the data
-        clean_lda_results = convert_numpy_types({
-            'topics': lda_topics,
-            'cluster_analysis': cluster_analysis
-        })
-        
-        lda_file = os.path.join(output_dir, "lda_topic_modeling.json")
-        with open(lda_file, 'w') as f:
-            json.dump(clean_lda_results, f, indent=2)
-        print(f"💾 LDA results saved: {lda_file}")
         
         # Save BERTopic results
         if bertopic_model:
@@ -495,6 +886,8 @@ class LegalTopicModeling:
             topics_file = os.path.join(output_dir, "bertopic_topics.csv")
             topics_info.to_csv(topics_file, index=False)
             print(f"💾 BERTopic topics saved: {topics_file}")
+        else:
+            print("⚠️ No BERTopic model to save")
 
 def load_data(file_path: str) -> pd.DataFrame:
     """Load the legal cases dataset"""
@@ -507,134 +900,110 @@ def load_data(file_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def main():
-    """Main execution function"""
-    print("🚀 Legal Topic Modeling & Case Clustering")
-    print("="*60)
-    
-    # Initialize topic modeling
-    topic_modeler = LegalTopicModeling()
-    
-    # Load data
-    data_file = "Text-mining-HTW/data/processed/cleaned/parse_legal_cases.csv"
-    df = load_data(data_file)
-    
-    if df.empty:
-        print("❌ No data loaded. Please check the file path.")
-        return
-    
-    # Limit to subset for processing efficiency
-    
-    #max_cases = min(500, len(df))
-    #df_subset = df.head(max_cases).copy()
-    df_subset = df.copy()
-    print(f"Processing {len(df_subset)} cases for topic modeling")
-   # df_subset = df.copy()
-    # Prepare documents
-    documents = topic_modeler.prepare_documents(df_subset, 'opinion_text')
-    
-    if len(documents) < 10:
-        print("❌ Insufficient documents for topic modeling")
-        return
-    
-    print(f"\n📊 Starting topic modeling with {len(documents)} documents...")
-    
-    # LDA Topic Modeling
-    print("\n" + "="*40)
-    print("LDA TOPIC MODELING")
-    print("="*40)
-    
-    # Find optimal number of topics
-    lda, vectorizer, lda_output = topic_modeler.fit_lda_model(
-        documents, n_topics=10, max_features=1000
-    )
-    
-    # Extract topics
-    lda_topics = topic_modeler.get_lda_topics(lda, vectorizer, n_words=10)
-    
-    # Print LDA topics
-    print("\n🔍 LDA TOPICS:")
-    for topic in lda_topics:
-        print(f"Topic {topic['topic_id']}: {topic['top_words_string']}")
-    
-    # Visualize LDA results
-    print(f"\n📊 Creating LDA visualizations...")
-    topic_modeler.visualize_lda_topics(lda_topics)
-    topic_modeler.visualize_topic_distribution(lda_output, lda_topics)
-    
-    # Cluster similar cases
-    print(f"\n🔍 Clustering similar legal cases...")
-    cluster_analysis = topic_modeler.cluster_similar_cases(lda_output, df_subset, n_clusters=5)
-    
-    print(f"\n📋 CLUSTER ANALYSIS:")
-    print(f"Silhouette Score: {cluster_analysis['silhouette_score']:.3f}")
-    
-    for cluster_id, cluster_info in cluster_analysis['clusters'].items():
-        print(f"\nCluster {cluster_id} (Size: {cluster_info['size']}):")
-        print(f"  Dominant Topic: {cluster_info['dominant_topic']}")
-        if cluster_info['sample_cases']:
-            print("  Sample Cases:")
-            for case in cluster_info['sample_cases']:
-                print(f"    - {case['case_name']} ({case['court_type']}, {case['year_filed']})")
-    
-    # BERTopic Modeling
-    if BERTOPIC_AVAILABLE:
-        print("\n" + "="*40)
-        print("BERTOPIC MODELING")
-        print("="*40)
+    """Main execution function with proper resource management for BERT topic modeling"""
+    with managed_joblib_context():
+        print("🚀 Legal BERT Topic Modeling")
+        print("="*60)
         
-        bertopic_model = topic_modeler.fit_bertopic_model(documents, min_topic_size=5)
+        # Initialize topic modeling
+        topic_modeler = LegalTopicModeling()
         
-        if bertopic_model:
-            # Print BERTopic topics
-            topic_info = bertopic_model.get_topic_info()
-            print(f"\n🔍 BERTOPIC TOPICS ({len(topic_info)} topics found):")
+        # Load data
+        data_file = "Text-mining-HTW/data/processed/cleaned/parse_legal_cases.csv"
+        df = load_data(data_file)
+        
+        if df.empty:
+            print("❌ No data loaded. Please check the file path.")
+            return
+        
+        # Random sample for topic modeling
+        max_cases = min(3000, len(df))
+        df_subset = df.sample(n=max_cases, random_state=42).copy()
+        print(f"Processing {len(df_subset)} cases for BERT topic modeling")
+        
+        # BERTopic Modeling
+        if BERTOPIC_AVAILABLE:
+            print("\n" + "="*40)
+            print("BERTOPIC MODELING")
+            print("="*40)
             
-            for _, row in topic_info.head(10).iterrows():
-                topic_id = row['Topic']
-                if topic_id != -1:  # Skip outlier topic
-                    words = bertopic_model.get_topic(topic_id)
-                    top_words = [word for word, _ in words[:5]]
-                    print(f"Topic {topic_id}: {', '.join(top_words)}")
+            # Prepare documents with legal-optimized preprocessing for BERTopic
+            bertopic_documents = topic_modeler.prepare_documents_for_bertopic(df_subset, 'opinion_text')
             
-            # Create BERTopic visualizations
-            print(f"\n📊 Creating BERTopic visualizations...")
-            topic_modeler.visualize_bertopic_results(bertopic_model, documents)
-    else:
-        bertopic_model = None
-        print("\n❌ BERTopic not available. Install with: pip install bertopic")
-    
-    # Save results
-    print(f"\n💾 Saving results...")
-    topic_modeler.save_results(lda_topics, cluster_analysis, bertopic_model)
-    
-    print(f"\n✅ Topic modeling complete!")
-    print(f"📊 Found {len(lda_topics)} LDA topics")
-    if bertopic_model:
-        n_bertopics = len(bertopic_model.get_topic_info()) - 1  # Exclude outlier topic
-        print(f"🤖 Found {n_bertopics} BERTopic topics")
-    print(f"🔍 Identified {cluster_analysis['n_clusters']} case clusters")
-    
-    # Force cleanup of parallel processing resources
-    print(f"\n🧹 Cleaning up resources...")
-    try:
-        # Try to access the parallel backend and clean up
-        from joblib._parallel_backends import ThreadingBackend
-        import joblib.parallel
+            if len(bertopic_documents) < 20:
+                print("❌ Insufficient documents for BERTopic modeling (need at least 20)")
+                return
+            
+            bertopic_model = topic_modeler.fit_bertopic_model_with_optimization(
+                bertopic_documents, 
+                data_size=len(df_subset)
+            )
+            
+            if bertopic_model:
+                # Print enhanced BERTopic topics analysis
+                topic_info = bertopic_model.get_topic_info()
+                n_topics = len(topic_info) - 1  # Exclude outlier topic
+                
+                print(f"\n🔍 BERTOPIC LEGAL TOPICS ANALYSIS:")
+                print(f"📊 Generated {n_topics} distinct legal topics")
+                
+                # Show top topics with legal domain interpretation
+                print(f"\n📋 TOP 15 LEGAL TOPICS:")
+                displayed_topics = 0
+                
+                for _, row in topic_info.iterrows():
+                    topic_id = row['Topic']
+                    if topic_id != -1 and displayed_topics < 15:  # Skip outlier topic, show top 15
+                        words = bertopic_model.get_topic(topic_id)
+                        top_words = [word for word, _ in words[:8]]
+                        word_weights = [f"{word}({weight:.3f})" for word, weight in words[:5]]
+                            
+                        # Attempt to categorize the topic
+                        legal_category = "General"
+                        topic_text = ' '.join(top_words)
+                            
+                        if any(term in topic_text for term in ['criminal', 'sentence', 'plea', 'defendant']):
+                            legal_category = "🔒 Criminal Law"
+                        elif any(term in topic_text for term in ['contract', 'agreement', 'breach']):
+                            legal_category = "📄 Contract Law"
+                        elif any(term in topic_text for term in ['property', 'real estate', 'lease']):
+                            legal_category = "🏠 Property Law"
+                        elif any(term in topic_text for term in ['family', 'custody', 'divorce', 'child']):
+                            legal_category = "👨‍👩‍👧‍👦 Family Law"
+                        elif any(term in topic_text for term in ['constitutional', 'amendment', 'rights']):
+                            legal_category = "⚖️ Constitutional Law"
+                        elif any(term in topic_text for term in ['employment', 'workplace', 'employee']):
+                            legal_category = "💼 Employment Law"
+                        elif any(term in topic_text for term in ['corporate', 'securities', 'shareholder']):
+                            legal_category = "🏢 Corporate Law"
+                        elif any(term in topic_text for term in ['tort', 'negligence', 'damages']):
+                            legal_category = "⚡ Tort Law"
+                            
+                        topic_size = row['Count']
+                        print(f"   Topic {topic_id:2d} ({topic_size:3d} cases) - {legal_category}")
+                        print(f"      Keywords: {', '.join(top_words[:6])}")
+                        print(f"      Weights:  {', '.join(word_weights)}")
+                        print()
+                        
+                        displayed_topics += 1
+                
+                # Create BERTopic visualizations
+                print(f"📊 Creating enhanced BERTopic visualizations...")
+                topic_modeler.visualize_bertopic_results(bertopic_model, bertopic_documents)
+                
+                # Save results
+                print(f"\n💾 Saving BERTopic results...")
+                topic_modeler.save_results(bertopic_model)
+                
+                print(f"\n✅ BERT topic modeling complete!")
+                print(f"🤖 Found {n_topics} BERTopic topics")
+            else:
+                print("❌ BERTopic model training failed")
+        else:
+            print("\n❌ BERTopic not available. Install with: pip install bertopic")
         
-        # Check if there's an active backend
-        if hasattr(joblib.parallel, '_default_backend'):
-            backend = getattr(joblib.parallel, '_default_backend', None)
-            if backend and hasattr(backend, '_pool') and backend._pool:
-                backend._pool.close()
-                backend._pool.join()
-        
-        # Force garbage collection
-        gc.collect()
-        print(f"✓ Resources cleaned up successfully")
-    except Exception as e:
-        # This is non-critical, so just do garbage collection
-        gc.collect()
-        print(f"✓ Resources cleaned up (basic cleanup only)")
+        # Final cleanup message
+        print(f"\n🧹 Automatic resource cleanup completed")
 
 if __name__ == "__main__":
     main()
