@@ -144,22 +144,27 @@ def plot_legal_domain_distribution():
     plt.show()
 
 def plot_topic_word_clouds():
-    """Plot 3: Word clouds for top 3 topics"""
+    """Plot 3: Word clouds for top 3 topics (same ranking as Plot 1)"""
     # Load actual model results
     lda_results = load_lda_results()
     topics = lda_results['topics']
     
-    # Calculate topic importance and get top 3
+    # Use EXACT SAME importance calculation as Plot 1
     topic_importance = []
     for topic in topics:
-        importance = np.mean(topic['weights'][:3])
-        topic_importance.append((importance, topic))
+        topic_id = topic['topic_id']
+        # Use average of top 10 weights as importance score (SAME AS PLOT 1)
+        importance = np.mean(topic['weights'][:10])
+        topic_importance.append((importance, topic_id, topic))
     
-    # Sort and get top 3
+    # Sort by importance (descending) - SAME AS PLOT 1
     topic_importance.sort(reverse=True)
-    top_3_topics = [item[1] for item in topic_importance[:3]]
     
-    # Remove unused descriptions_map since we use actual model data
+    # Get top 3 topics from Plot 1 ranking
+    top_3_topics = [item[2] for item in topic_importance[:3]]  # item[2] is the topic object
+    
+    print(f"Plot 1 ranking order: {[item[1] for item in topic_importance]}")
+    print(f"Plot 3 using top 3: {[topic['topic_id'] for topic in top_3_topics]}")
     
     topics_data = []
     for i, topic in enumerate(top_3_topics):
@@ -202,7 +207,7 @@ def plot_topic_word_clouds():
         ax.spines['right'].set_visible(False)
         ax.grid(axis='x', alpha=0.3, linestyle='--')
     
-    plt.suptitle('Top 3 Topics - Key Legal Terms', fontsize=16, fontweight='bold')
+    plt.suptitle('Top 3 Topics from Plot 1 Ranking - Key Legal Terms', fontsize=16, fontweight='bold')
     plt.tight_layout()
     plt.savefig('/Users/liuyafei/Text_mining/plot3_topic_words.png', dpi=300, bbox_inches='tight')
     plt.show()
