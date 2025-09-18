@@ -129,7 +129,7 @@ def analyze_court_overwriting():
     # Print results following the decision tree
     print_decision_tree_results(results, override_cases, affirmed_cases, related_but_not_override)
     
-    return df, override_cases, affirmed_cases
+    return df, override_cases, affirmed_cases, results
 
 def check_for_related_case(case):
     """
@@ -247,7 +247,7 @@ def check_override_language(case):
         'text_checked': text_to_check[:200] + "..." if len(text_to_check) > 200 else text_to_check
     }
 
-def print_decision_tree_results(results, override_cases, affirmed_cases, related_but_not_override):
+def print_decision_tree_results(results, override_cases, affirmed_cases, _):
     """
     Print results following the decision tree structure
     """
@@ -486,49 +486,223 @@ def analyze_override_case_examples(override_df):
             if disposition_text and len(disposition_text) > 20:
                 print(f"   Context: {disposition_text}")
 
-def create_override_visualizations(override_df, df):
+def generate_distinct_colors(n, base_colors=None):
     """
-    Create visualizations for override patterns
+    Generate n colors that are maximally different from neighboring colors
+    Uses HSV color space to ensure visual distinction
+    """
+    import colorsys
+    import numpy as np
+    
+    if base_colors and len(base_colors) >= n:
+        return base_colors[:n]
+    
+    # Generate colors using golden ratio for optimal distribution
+    golden_ratio = 0.618033988749895
+    colors = []
+    
+    for i in range(n):
+        # Use golden ratio to distribute hues evenly
+        hue = (i * golden_ratio) % 1.0
+        
+        # Alternate saturation and value to increase distinction
+        saturation = 0.65 + (i % 3) * 0.15  # Values: 0.65, 0.8, 0.95
+        value = 0.75 + (i % 2) * 0.2        # Values: 0.75, 0.95
+        
+        # Convert HSV to RGB
+        rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+        # Convert to hex
+        hex_color = '#{:02x}{:02x}{:02x}'.format(
+            int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
+        )
+        colors.append(hex_color)
+    
+    return colors
+
+def create_override_visualizations(override_df, df, override_cases, results):
+    """
+    Create separate individual visualizations for override patterns with professional styling
     """
     print(f"\n" + "="*80)
-    print("OVERRIDE PATTERN VISUALIZATIONS")
+    print("CREATING SEPARATE OVERRIDE PATTERN VISUALIZATIONS")
     print("="*80)
     
     try:
         import matplotlib.pyplot as plt
         import seaborn as sns
         
-        # Set up the plotting style
-        plt.style.use('default')
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        # Set professional styling
+        plt.style.use('seaborn-v0_8-darkgrid')
+        sns.set_palette("Set2")
         
-        # 1. Override Types Distribution
+        # Define base colors ensuring neighboring bars are different
+        base_colors = ['#FF6B6B', '#4ECDC4', '#FFA500', '#8A2BE2', '#32CD32', '#FF1493', '#00CED1', '#FFD700', 
+                      '#DC143C', '#7FFF00', '#9370DB', '#FF4500', '#00FA9A', '#FF69B4', '#1E90FF', '#FFFF00']
+        
+        # Generate distinct colors for all visualizations
+        colors = generate_distinct_colors(16, base_colors)
+        
+        # 1. Enhanced Override Types Distribution (Donut Chart)
+        plt.figure(figsize=(10, 8))
         override_type_counts = override_df['override_type'].value_counts()
-        axes[0, 0].pie(override_type_counts.values, labels=[t.replace('_', ' ').title() for t in override_type_counts.index], 
-                       autopct='%1.1f%%', startangle=90)
-        axes[0, 0].set_title('Distribution of Override Types', fontsize=14, fontweight='bold')
         
-        # 2. Override by Court Type
-        court_override_counts = override_df['court_type'].value_counts().head(8)
-        axes[0, 1].barh(range(len(court_override_counts)), court_override_counts.values, color='coral')
-        axes[0, 1].set_yticks(range(len(court_override_counts)))
-        axes[0, 1].set_yticklabels(court_override_counts.index)
-        axes[0, 1].set_xlabel('Number of Override Cases')
-        axes[0, 1].set_title('Overrides by Court Type (Top 8)', fontsize=14, fontweight='bold')
+        # Create donut chart
+        plt.pie(override_type_counts.values, 
+               labels=[t.replace('_', ' ').title() for t in override_type_counts.index],
+               autopct='%1.1f%%', 
+               startangle=90,
+               colors=colors[:len(override_type_counts)],
+               pctdistance=0.85,
+               explode=[0.05]*len(override_type_counts))
         
-        # 3. Temporal Override Trend
+        # Create donut hole
+        centre_circle = plt.Circle((0,0), 0.60, fc='white')
+        plt.gca().add_artist(centre_circle)
+        
+        plt.title('Override Types Distribution\n(Decision Tree Step 3)', 
+                 fontsize=18, fontweight='bold', pad=30)
+        
+        # Add total in center
+        total_overrides = len(override_cases)  # Use original override_cases for consistency
+        plt.text(0, 0, f'Total\n{total_overrides:,}\nOverrides', 
+                ha='center', va='center', fontsize=16, fontweight='bold')
+        
+        plt.tight_layout()
+        output_path1 = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot1_override_types.png'
+        plt.savefig(output_path1, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 1 saved: {output_path1}")
+        plt.show()
+        
+        # 2. Enhanced Court Type Analysis
+        plt.figure(figsize=(12, 8))
+        
+        # Count court types from original override_cases
+        court_type_counts = {}
+        for case in override_cases:
+            court_type = case.get('court_type', 'Unknown')
+            court_type_counts[court_type] = court_type_counts.get(court_type, 0) + 1
+        
+        # Convert to sorted series and get top 10
+        court_override_counts = pd.Series(court_type_counts).sort_values(ascending=False).head(10)
+        
+        # Verify totals add up
+        total_shown = court_override_counts.sum()
+        total_overrides = len(override_cases)
+        remaining_overrides = total_overrides - total_shown
+        total_court_types = len(court_type_counts)
+        
+        print(f"Debug: Found {total_court_types} distinct court types")
+        print(f"Debug: Top 10 sum to {total_shown}, total overrides: {total_overrides}")
+        
+        # Calculate override rates
+        court_rates = []
+        for court in court_override_counts.index:
+            total_court_cases = (df['court_type'] == court).sum()
+            rate = (court_override_counts[court] / total_court_cases) * 100 if total_court_cases > 0 else 0
+            court_rates.append(rate)
+        
+        bars = plt.barh(range(len(court_override_counts)), court_override_counts.values, 
+                       color=colors[:len(court_override_counts)], alpha=0.8, edgecolor='white', linewidth=2)
+        
+        # Add value labels on bars
+        for bar, rate in zip(bars, court_rates):
+            width = bar.get_width()
+            plt.text(width + max(court_override_counts.values) * 0.01, bar.get_y() + bar.get_height()/2,
+                    f'{int(width)} ({rate:.1f}%)', ha='left', va='center', fontweight='bold', fontsize=11)
+        
+        plt.yticks(range(len(court_override_counts)), 
+                  [f"{court}\n({(df['court_type'] == court).sum():,} total)" 
+                   for court in court_override_counts.index], fontsize=11)
+        plt.xlabel('Number of Override Cases', fontsize=14, fontweight='bold')
+        
+        # Update title to show totals
+        if remaining_overrides > 0:
+            title = f'Overrides by Court Type (Top 10)\nShowing {total_shown:,} of {total_overrides:,} total overrides ({remaining_overrides:,} others)'
+        else:
+            title = f'Overrides by Court Type\nAll {total_court_types} Court Types ({total_overrides:,} total overrides)'
+        plt.title(title, fontsize=18, fontweight='bold', pad=30)
+        plt.grid(True, alpha=0.3, axis='x')
+        
+        plt.tight_layout()
+        output_path2 = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot2_court_types.png'
+        plt.savefig(output_path2, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 2 saved: {output_path2}")
+        plt.show()
+        
+        # 3. Enhanced Temporal Analysis
+        plt.figure(figsize=(12, 8))
         if 'year_filed' in override_df.columns:
             yearly_overrides = override_df['year_filed'].value_counts().sort_index()
-            yearly_overrides = yearly_overrides[yearly_overrides.index >= 2020]  # Recent years only
+            yearly_overrides = yearly_overrides[yearly_overrides.index >= 2015]  # Last 8+ years
             
-            axes[1, 0].plot(yearly_overrides.index, yearly_overrides.values, marker='o', linewidth=2, markersize=8, color='red')
-            axes[1, 0].set_xlabel('Year')
-            axes[1, 0].set_ylabel('Number of Override Cases')
-            axes[1, 0].set_title('Override Cases Trend (2020+)', fontsize=14, fontweight='bold')
-            axes[1, 0].grid(True, alpha=0.3)
+            # Create area plot
+            plt.fill_between(yearly_overrides.index, yearly_overrides.values, alpha=0.3, color='#FF6B6B')
+            plt.plot(yearly_overrides.index, yearly_overrides.values, marker='o', linewidth=4, 
+                    markersize=10, color='#FF6B6B', markerfacecolor='white', markeredgewidth=3)
+            
+            # Add value labels on points
+            for year, count in yearly_overrides.items():
+                plt.annotate(f'{int(count)}', (year, count), textcoords="offset points", 
+                           xytext=(0,15), ha='center', fontweight='bold', fontsize=12)
+            
+            plt.xlabel('Year Filed', fontsize=14, fontweight='bold')
+            plt.ylabel('Override Cases', fontsize=14, fontweight='bold')
+            plt.title('Override Cases Temporal Trend\n(2015 onwards)', fontsize=18, fontweight='bold', pad=30)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(yearly_overrides.index, rotation=45)
         
-        # 4. Override Rate by Court Type
+        plt.tight_layout()
+        output_path3 = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot3_temporal_trend.png'
+        plt.savefig(output_path3, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 3 saved: {output_path3}")
+        plt.show()
+        
+        # 4. Decision Tree Flow Visualization
+        plt.figure(figsize=(14, 8))
+        
+        # Use actual decision tree statistics from results
+        total_cases = results['total_cases']
+        has_related = results['step1_has_related']
+        higher_court = results['step2_higher_court']
+        override_found = results['step3_override_yes']
+        
+        stages = ['Total\nCases', 'Has Related\nCase', 'Higher Court\nInvolved', 'Override\nDetected']
+        values = [total_cases, has_related, higher_court, override_found]
+        percentages = [100, 
+                      (has_related/total_cases)*100 if total_cases > 0 else 0,
+                      (higher_court/has_related)*100 if has_related > 0 else 0,
+                      (override_found/higher_court)*100 if higher_court > 0 else 0]
+        
+        # Create funnel-like visualization
+        bar_width = 0.6
+        positions = list(range(len(stages)))
+        
+        bars = plt.bar(positions, values, width=bar_width, 
+                      color=['#E8F4FD', '#B3E0FF', '#7FC7FF', '#FF6B6B'], 
+                      alpha=0.8, edgecolor='white', linewidth=3)
+        
+        # Add value labels
+        for bar, val, pct in zip(bars, values, percentages):
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height + max(values) * 0.02,
+                    f'{val:,}\n({pct:.1f}%)', ha='center', va='bottom', fontweight='bold', fontsize=12)
+        
+        plt.xticks(positions, stages, fontsize=12, fontweight='bold')
+        plt.ylabel('Number of Cases', fontsize=14, fontweight='bold')
+        plt.title('Decision Tree Analysis Flow\n(Case Filtering Process)', fontsize=18, fontweight='bold', pad=30)
+        plt.grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        output_path4 = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot4_decision_tree_flow.png'
+        plt.savefig(output_path4, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 4 saved: {output_path4}")
+        plt.show()
+        
+        # 5. Override Rate Comparison by Court Type
+        plt.figure(figsize=(12, 8))
         court_override_rates = []
+        court_names = []
+        
         for court_type in df['court_type'].unique():
             if pd.isna(court_type):
                 continue
@@ -537,36 +711,442 @@ def create_override_visualizations(override_df, df):
             
             if total_cases >= 50:  # Minimum case threshold
                 override_rate = (override_cases_count / total_cases) * 100
-                court_override_rates.append((court_type, override_rate))
+                court_override_rates.append(override_rate)
+                court_names.append(f"{court_type}\n({total_cases:,} cases)")
         
-        # Sort and take top 10
-        court_override_rates.sort(key=lambda x: x[1], reverse=True)
-        court_override_rates = court_override_rates[:10]
+        # Sort by rate
+        sorted_data = sorted(zip(court_override_rates, court_names), reverse=True)[:8]
+        rates, names = zip(*sorted_data) if sorted_data else ([], [])
         
-        if court_override_rates:
-            court_types, rates = zip(*court_override_rates)
-            axes[1, 1].barh(range(len(court_types)), rates, color='lightblue')
-            axes[1, 1].set_yticks(range(len(court_types)))
-            axes[1, 1].set_yticklabels(court_types)
-            axes[1, 1].set_xlabel('Override Rate (%)')
-            axes[1, 1].set_title('Override Rate by Court Type', fontsize=14, fontweight='bold')
+        if rates:
+            distinct_colors = generate_distinct_colors(len(rates))
+            bars = plt.bar(range(len(rates)), rates, 
+                          color=distinct_colors, alpha=0.8, edgecolor='white', linewidth=2)
+            
+            # Add value labels
+            for bar, rate in zip(bars, rates):
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + max(rates) * 0.01,
+                        f'{rate:.1f}%', ha='center', va='bottom', fontweight='bold', fontsize=12)
+            
+            plt.xticks(range(len(names)), names, rotation=45, ha='right', fontsize=10)
+            plt.ylabel('Override Rate (%)', fontsize=14, fontweight='bold')
+            plt.title('Override Rates by Court Type\n(Min 50 cases)', fontsize=18, fontweight='bold', pad=30)
+            plt.grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
-        plt.savefig('/Users/liuyafei/Text_mining/Text-mining-HTW/override_analysis.png', 
-                    dpi=300, bbox_inches='tight')
-        print(f"📈 Visualizations saved: override_analysis.png")
+        output_path5 = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot5_override_rates.png'
+        plt.savefig(output_path5, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 5 saved: {output_path5}")
         plt.show()
         
+        # 6. Override Impact Analysis
+        plt.figure(figsize=(10, 8))
+        if 'citation_count' in override_df.columns:
+            # Create citation impact comparison
+            override_citations = override_df['citation_count'].fillna(0)
+            all_citations = df['citation_count'].fillna(0)
+            
+            # Create box plots with distinct colors
+            data_to_plot = [all_citations[all_citations <= 50], override_citations[override_citations <= 50]]
+            box_plot = plt.boxplot(data_to_plot, labels=['All Cases\n(≤50 citations)', 'Override Cases\n(≤50 citations)'], 
+                                  patch_artist=True, notch=True)
+            
+            # Customize box plot colors - ensure high contrast
+            colors_box = ['#4ECDC4', '#FF6B6B']  # Distinct cyan and red
+            for patch, color in zip(box_plot['boxes'], colors_box):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.7)
+            
+            plt.ylabel('Citation Count', fontsize=14, fontweight='bold')
+            plt.title('Citation Impact Comparison\n(Override vs All Cases)', fontsize=18, fontweight='bold', pad=30)
+            plt.grid(True, alpha=0.3, axis='y')
+            
+            # Add mean lines
+            plt.axhline(y=all_citations.mean(), color='blue', linestyle='--', alpha=0.7, linewidth=2,
+                       label=f'All Cases Mean: {all_citations.mean():.1f}')
+            plt.axhline(y=override_citations.mean(), color='red', linestyle='--', alpha=0.7, linewidth=2,
+                       label=f'Override Mean: {override_citations.mean():.1f}')
+            plt.legend(fontsize=12)
+        
+        plt.tight_layout()
+        output_path6 = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot6_citation_impact.png'
+        plt.savefig(output_path6, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 6 saved: {output_path6}")
+        plt.show()
+        
+        # 7. Location Distribution Visualization
+        create_location_distribution_plot(override_cases, df)
+        
+        print(f"\n✅ All 7 separate plots created and saved successfully!")
+        
     except ImportError:
-        print("📊 Matplotlib not available - skipping visualizations")
+        print("📊 Required visualization libraries not available - install matplotlib and seaborn")
     except Exception as e:
         print(f"📊 Visualization error: {e}")
+        import traceback
+        traceback.print_exc()
+
+def create_location_distribution_plot(override_cases, df):
+    """
+    Create simple and elegant location distribution visualization
+    """
+    print(f"\n📍 Creating Location Distribution Visualization...")
+    
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Extract jurisdiction data from override cases
+        jurisdictions = {}
+        for case in override_cases:
+            # Get jurisdiction from the dataframe using case_name as key
+            case_name = case.get('case_name', '')
+            if case_name:
+                # Find matching row in dataframe
+                matching_row = df[df['case_name'] == case_name]
+                if not matching_row.empty:
+                    jurisdiction = matching_row.iloc[0].get('court_jurisdiction', 'Unknown')
+                else:
+                    jurisdiction = 'Unknown'
+            else:
+                jurisdiction = 'Unknown'
+            
+            if jurisdiction and str(jurisdiction) != 'nan':
+                jurisdictions[jurisdiction] = jurisdictions.get(jurisdiction, 0) + 1
+        
+        # Clean and prepare data - fix Iowa misspelling
+        # Fix common misspellings
+        jurisdiction_mapping = {
+            'lowa': 'Iowa, IA',
+            'Lowa': 'Iowa, IA'
+        }
+        
+        # Apply corrections
+        corrected_jurisdictions = {}
+        for jur, count in jurisdictions.items():
+            corrected_jur = jurisdiction_mapping.get(jur, jur)
+            corrected_jurisdictions[corrected_jur] = corrected_jurisdictions.get(corrected_jur, 0) + count
+        
+        jurisdiction_counts = pd.Series(corrected_jurisdictions).sort_values(ascending=False)
+        
+        # Take top 12 jurisdictions for clarity
+        top_jurisdictions = jurisdiction_counts.head(12)
+        
+        if len(top_jurisdictions) == 0:
+            print("📍 No jurisdiction data available for visualization")
+            return
+        
+        # Create the visualization
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # Prepare pie data first to get consistent color mapping
+        pie_data = top_jurisdictions.copy()
+        
+        # Calculate total for verification
+        total_shown_overrides = top_jurisdictions.sum()
+        all_overrides_total = sum(corrected_jurisdictions.values())
+        others_count = all_overrides_total - total_shown_overrides
+        
+        # Only add "Others" if there are remaining jurisdictions beyond top 12
+        if others_count > 0:
+            pie_data = pd.concat([pie_data, pd.Series({'Others': others_count})])
+        
+        # Create distinct colors ensuring each element is visually different from neighbors
+        colors_all = generate_distinct_colors(len(pie_data))
+        
+        # Left plot: Horizontal bar chart - use same colors as pie chart
+        colors_bar = colors_all[:len(top_jurisdictions)]  # Only colors for bar chart items
+        bars = ax1.barh(range(len(top_jurisdictions)), top_jurisdictions.values, 
+                       color=colors_bar, alpha=0.8, edgecolor='white', linewidth=2)
+        
+        # Enhance bar chart
+        ax1.set_yticks(range(len(top_jurisdictions)))
+        ax1.set_yticklabels([jur[:30] + '...' if len(str(jur)) > 30 else str(jur) 
+                            for jur in top_jurisdictions.index], fontsize=10)
+        ax1.set_xlabel('Number of Override Cases', fontsize=12, fontweight='bold')
+        ax1.set_title('Override Cases by Jurisdiction\n(Top 12 Locations)', 
+                     fontsize=14, fontweight='bold', pad=20)
+        
+        # Add value labels on bars
+        for bar, value in zip(bars, top_jurisdictions.values):
+            width = bar.get_width()
+            ax1.text(width + max(top_jurisdictions.values) * 0.01, 
+                    bar.get_y() + bar.get_height()/2,
+                    f'{int(value)}', ha='left', va='center', fontweight='bold', fontsize=10)
+        
+        ax1.grid(True, alpha=0.3, axis='x')
+        ax1.invert_yaxis()  # Highest values at top
+        
+        # Right plot: Pie chart for proportions - use EXACT same data as bar chart
+        # Create donut chart with consistent colors
+        wedges, texts, autotexts = ax2.pie(pie_data.values, 
+                                          labels=[str(jur)[:15] + '...' if len(str(jur)) > 15 else str(jur) 
+                                                 for jur in pie_data.index],
+                                          autopct='%1.1f%%', 
+                                          startangle=90,
+                                          colors=colors_all,  # Use the same color array
+                                          pctdistance=0.85,
+                                          labeldistance=1.05)
+        
+        # Create donut hole
+        centre_circle = plt.Circle((0,0), 0.60, fc='white')
+        ax2.add_artist(centre_circle)
+        
+        # Add total in center - use ALL override cases, not just top 12
+        total_all_overrides = all_overrides_total
+        ax2.text(0, 0, f'Total\n{total_all_overrides:,}\nOverrides', 
+                ha='center', va='center', fontsize=12, fontweight='bold')
+        
+        ax2.set_title('Geographic Distribution\n(Proportion by Location)', 
+                     fontsize=14, fontweight='bold', pad=20)
+        
+        # Enhance text readability
+        for text in texts:
+            text.set_fontsize(9)
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontweight('bold')
+            autotext.set_fontsize(9)
+        
+        plt.tight_layout()
+        
+        output_path = '/Users/liuyafei/Text_mining/Text-mining-HTW/plot7_location_distribution.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Plot 7 saved: {output_path}")
+        plt.show()
+        
+        # Print summary statistics - use correct totals
+        print(f"\n📊 Location Distribution Summary:")
+        print(f"   • Total jurisdictions with overrides: {len(corrected_jurisdictions)}")
+        print(f"   • Top jurisdiction: {top_jurisdictions.index[0]} ({top_jurisdictions.iloc[0]:,} cases)")
+        print(f"   • Geographic coverage: {len(corrected_jurisdictions)} distinct locations")
+        print(f"   • Total overrides shown in top 12: {total_shown_overrides:,}")
+        print(f"   • All override cases total: {total_all_overrides:,}")
+        
+        coverage_pct = (top_jurisdictions.head(5).sum() / total_all_overrides) * 100
+        print(f"   • Top 5 jurisdictions account for: {coverage_pct:.1f}% of all overrides")
+        
+    except Exception as e:
+        print(f"📍 Location visualization error: {e}")
+        import traceback
+        traceback.print_exc()
+
+def create_decision_tree_dashboard(results, override_cases, affirmed_cases, df):
+    """
+    Create separate decision tree visualization plots
+    """
+    print(f"\n" + "="*80)
+    print("CREATING SEPARATE DECISION TREE ANALYSIS PLOTS")
+    print("="*80)
+    
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyBboxPatch
+        
+        # Professional colors ensuring maximum distinction between neighbors
+        colors = {
+            'total': '#E8F4FD',
+            'related': '#B3E0FF', 
+            'higher_court': '#7FC7FF',
+            'override': '#FF6B6B',
+            'affirmed': '#4ECDC4',
+            'dismissed': '#96CEB4',
+            'other': '#FFEAA7'
+        }
+        
+        # Calculate percentages and values
+        total = results['total_cases']
+        step1_related = results['step1_has_related']
+        step1_no_related = results['step1_no_related']
+        step2_higher = results['step2_higher_court']
+        step2_same_lower = results['step2_same_or_lower']
+        step3_override = results['step3_override_yes']
+        
+        # 1. Decision Tree Flow (Sankey-style)
+        plt.figure(figsize=(16, 8))
+        
+        # Create flowing bars
+        stages = [
+            ('Total Cases', total, colors['total']),
+            ('Related Cases', step1_related, colors['related']),
+            ('Higher Court', step2_higher, colors['higher_court']),
+            ('Override Found', step3_override, colors['override'])
+        ]
+        
+        positions = [0, 1.5, 3, 4.5]
+        max_val = total
+        
+        for i, (label, value, color) in enumerate(stages):
+            bar_height = (value / max_val) * 0.8  # Scale to fit
+            y_pos = 0.5 - bar_height/2
+            
+            # Draw bar
+            rect = FancyBboxPatch((positions[i]-0.3, y_pos), 0.6, bar_height,
+                                 boxstyle="round,pad=0.02", 
+                                 facecolor=color, edgecolor='white', linewidth=3)
+            plt.gca().add_patch(rect)
+            
+            # Add labels
+            plt.text(positions[i], 0.1, label, ha='center', va='center', 
+                    fontweight='bold', fontsize=14, rotation=0)
+            plt.text(positions[i], y_pos + bar_height/2, f'{value:,}\n({value/total*100:.1f}%)', 
+                    ha='center', va='center', fontweight='bold', fontsize=13)
+            
+            # Draw flow arrows
+            if i < len(stages) - 1:
+                plt.arrow(positions[i] + 0.35, 0.5, 0.8, 0, head_width=0.03, 
+                         head_length=0.1, fc='gray', ec='gray', alpha=0.7)
+        
+        plt.xlim(-0.5, 5)
+        plt.ylim(0, 1)
+        plt.axis('off')
+        plt.title('Decision Tree Flow Analysis', fontsize=20, fontweight='bold', pad=30)
+        
+        plt.tight_layout()
+        output_path1 = '/Users/liuyafei/Text_mining/Text-mining-HTW/dashboard1_decision_tree_flow.png'
+        plt.savefig(output_path1, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Dashboard Plot 1 saved: {output_path1}")
+        plt.show()
+        
+        # 2. Step-by-Step Breakdown
+        plt.figure(figsize=(14, 8))
+        
+        step_data = [
+            ('Step 1: Related Cases', step1_related, step1_no_related),
+            ('Step 2: Higher Court', step2_higher, step2_same_lower),
+            ('Step 3: Override Result', step3_override, step2_higher - step3_override)
+        ]
+        
+        y_positions = [2, 1, 0]
+        bar_width = 0.35
+        
+        for idx, (_, pass_count, fail_count) in enumerate(step_data):
+            total_step = pass_count + fail_count
+            pass_pct = (pass_count / total_step * 100) if total_step > 0 else 0
+            fail_pct = (fail_count / total_step * 100) if total_step > 0 else 0
+            
+            # Pass bar (right side)
+            plt.barh(y_positions[idx], pass_pct, bar_width, left=0, 
+                    color=colors['override'], alpha=0.8, label='Pass' if idx == 0 else "")
+            
+            # Fail bar (left side)  
+            plt.barh(y_positions[idx], -fail_pct, bar_width, left=0,
+                    color=colors['dismissed'], alpha=0.8, label='Filtered Out' if idx == 0 else "")
+            
+            # Add labels
+            plt.text(pass_pct/2, y_positions[idx], f'{pass_count:,}\n({pass_pct:.1f}%)', 
+                    ha='center', va='center', fontweight='bold', fontsize=11)
+            plt.text(-fail_pct/2, y_positions[idx], f'{fail_count:,}\n({fail_pct:.1f}%)', 
+                    ha='center', va='center', fontweight='bold', fontsize=11)
+        
+        plt.yticks(y_positions, [step_name for step_name, _, _ in step_data], fontsize=12)
+        plt.xlabel('Percentage of Cases', fontsize=14, fontweight='bold')
+        plt.title('Decision Tree Step Analysis\n(Pass vs Filtered)', fontsize=18, fontweight='bold', pad=30)
+        plt.legend(fontsize=12)
+        plt.grid(True, alpha=0.3, axis='x')
+        
+        plt.tight_layout()
+        output_path2 = '/Users/liuyafei/Text_mining/Text-mining-HTW/dashboard2_step_breakdown.png'
+        plt.savefig(output_path2, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Dashboard Plot 2 saved: {output_path2}")
+        plt.show()
+        
+        # 3. Override Types with Enhanced Detail
+        plt.figure(figsize=(10, 8))
+        
+        if len(override_cases) > 0:
+            # Extract override types from original override_cases
+            override_types = [case['override_type'] for case in override_cases if case.get('override_type')]
+            override_counts = pd.Series(override_types).value_counts()
+            
+            # Create enhanced pie chart with distinct neighboring colors
+            override_counts = pd.Series(override_types).value_counts()
+            distinct_pie_colors = generate_distinct_colors(len(override_counts))
+            
+            _, _, autotexts = plt.pie(override_counts.values, 
+                                     labels=[t.replace('_', ' ').title() for t in override_counts.index],
+                                     autopct=lambda pct: f'{pct:.1f}%\n({int(pct/100*len(override_cases))})',
+                                     startangle=90,
+                                     colors=distinct_pie_colors,
+                                     explode=[0.05]*len(override_counts),
+                                     textprops={'fontsize': 11, 'fontweight': 'bold'})
+            
+            # Enhance text visibility
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontweight('bold')
+        
+        plt.title(f'Override Types Distribution\n({len(override_cases):,} Total Override Cases)', 
+                 fontsize=18, fontweight='bold', pad=30)
+        
+        plt.tight_layout()
+        output_path3 = '/Users/liuyafei/Text_mining/Text-mining-HTW/dashboard3_override_types.png'
+        plt.savefig(output_path3, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Dashboard Plot 3 saved: {output_path3}")
+        plt.show()
+        
+        # 4. Court Performance Matrix
+        plt.figure(figsize=(12, 8))
+        
+        # Get top courts by case volume
+        top_courts = df['court_type'].value_counts().head(8)
+        court_data = []
+        
+        for court in top_courts.index:
+            total_cases = (df['court_type'] == court).sum()
+            # Count overrides from original override_cases list
+            override_cases_count = sum(1 for case in override_cases if case.get('court_type') == court)
+            override_rate = (override_cases_count / total_cases * 100) if total_cases > 0 else 0
+            
+            court_data.append({
+                'court': court,
+                'total': total_cases,
+                'overrides': override_cases_count,
+                'rate': override_rate
+            })
+        
+        # Create bubble chart data
+        x_vals = [d['total'] for d in court_data]
+        y_vals = [d['rate'] for d in court_data]
+        sizes = [d['overrides'] * 20 for d in court_data]  # Scale bubble size
+        
+        # Create bubble chart with distinct colors for each court
+        scatter_colors = generate_distinct_colors(len(court_data))
+        plt.scatter(x_vals, y_vals, s=sizes, alpha=0.6, 
+                   c=scatter_colors, edgecolors='black')
+        
+        # Add court labels
+        for d in court_data:
+            plt.annotate(d['court'], (d['total'], d['rate']), 
+                        xytext=(5, 5), textcoords='offset points',
+                        fontsize=10, fontweight='bold')
+        
+        plt.xlabel('Total Cases (Log Scale)', fontsize=14, fontweight='bold')
+        plt.ylabel('Override Rate (%)', fontsize=14, fontweight='bold') 
+        plt.xscale('log')
+        plt.title('Court Performance Matrix\n(Bubble size = Override Count)', 
+                 fontsize=18, fontweight='bold', pad=30)
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        output_path4 = '/Users/liuyafei/Text_mining/Text-mining-HTW/dashboard4_court_performance.png'
+        plt.savefig(output_path4, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        print(f"📈 Dashboard Plot 4 saved: {output_path4}")
+        plt.show()
+        
+        print(f"\n✅ All 4 separate dashboard plots created and saved successfully!")
+        
+    except Exception as e:
+        print(f"📊 Dashboard creation error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def main():
     """Enhanced main analysis function"""
     print("Starting Court Overwriting Analysis with Decision Tree Logic...")
     
-    df, override_cases, affirmed_cases = analyze_court_overwriting()
+    df, override_cases, affirmed_cases, results = analyze_court_overwriting()
     
     if df is not None and override_cases:
         print(f"\n🎉 Basic Analysis Complete!")
@@ -574,13 +1154,16 @@ def main():
         print(f"   Total affirmed cases found: {len(affirmed_cases):,}")
         
         # Detailed pattern analysis
-        override_df, affirmed_df = analyze_override_patterns(df, override_cases, affirmed_cases)
+        override_df, _ = analyze_override_patterns(df, override_cases, affirmed_cases)
         
         # Show case examples
         analyze_override_case_examples(override_df)
         
-        # Create visualizations
-        create_override_visualizations(override_df, df)
+        # Create main visualizations
+        create_override_visualizations(override_df, df, override_cases, results)
+        
+        # Create decision tree dashboard using actual results
+        create_decision_tree_dashboard(results, override_cases, affirmed_cases, df)
         
         print(f"\n" + "="*80)
         print("FINAL COMPREHENSIVE SUMMARY")
@@ -620,7 +1203,7 @@ def main():
   • Override patterns follow legal precedent and jurisdictional rules
         """)
     
-    return df, override_cases, affirmed_cases
+    return df, override_cases, affirmed_cases, results
 
 if __name__ == "__main__":
-    df, override_cases, affirmed_cases = main()
+    df, override_cases, affirmed_cases, results = main()
